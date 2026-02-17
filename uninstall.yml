@@ -1,0 +1,130 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: true
+  tasks:
+    - name: Resolve S2T target user
+      set_fact:
+        s2t_target_user: >-
+          {{
+            (
+              ansible_user_id == 'root'
+              and (ansible_env.SUDO_USER | default('') | trim | length > 0)
+              and (ansible_env.SUDO_USER != 'root')
+            ) | ternary(ansible_env.SUDO_USER, ansible_user_id)
+          }}
+      changed_when: false
+
+    - name: Resolve S2T target user account details
+      command: "getent passwd {{ s2t_target_user }}"
+      register: s2t_target_passwd_entry
+      changed_when: false
+
+    - name: Set S2T target home and uid
+      set_fact:
+        s2t_target_uid: "{{ (s2t_target_passwd_entry.stdout.split(':')[2]) | int }}"
+        s2t_target_home: "{{ s2t_target_passwd_entry.stdout.split(':')[5] }}"
+      changed_when: false
+
+    - name: Stop and disable s2t-monitor user service
+      systemd:
+        name: s2t-monitor
+        scope: user
+        state: stopped
+        enabled: no
+      become_user: "{{ s2t_target_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
+      ignore_errors: yes
+
+    - name: Stop and disable s2t-whisper user service
+      systemd:
+        name: s2t-whisper
+        scope: user
+        state: stopped
+        enabled: no
+      become_user: "{{ s2t_target_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
+      ignore_errors: yes
+
+    - name: Remove s2t-monitor unit
+      file:
+        path: "{{ s2t_target_home }}/.config/systemd/user/s2t-monitor.service"
+        state: absent
+
+    - name: Remove s2t-whisper unit
+      file:
+        path: "{{ s2t_target_home }}/.config/systemd/user/s2t-whisper.service"
+        state: absent
+
+    - name: Disable GNOME extension
+      command: gnome-extensions disable s2t-toggle@local
+      become_user: "{{ s2t_target_user }}"
+      environment:
+        HOME: "{{ s2t_target_home }}"
+        XDG_DATA_HOME: "{{ s2t_target_home }}/.local/share"
+      register: s2t_gnome_disable
+      changed_when: false
+      failed_when: false
+
+    - name: Remove GNOME extension
+      file:
+        path: "{{ s2t_target_home }}/.local/share/gnome-shell/extensions/s2t-toggle@local"
+        state: absent
+
+    - name: Remove S2T env import autostart entry
+      file:
+        path: "{{ s2t_target_home }}/.config/autostart/s2t-env-import.desktop"
+        state: absent
+
+    - name: Stop services and remove system config
+      block:
+        - name: Stop and disable keyd
+          systemd:
+            name: keyd
+            state: stopped
+            enabled: no
+          ignore_errors: yes # Might not exist
+
+        - name: Stop and disable ydotoold
+          systemd:
+            name: ydotoold
+            state: stopped
+            enabled: no
+          ignore_errors: yes
+
+        - name: Remove system services
+          file:
+            path: "/etc/systemd/system/{{ item }}"
+            state: absent
+          loop:
+            - keyd.service
+            - ydotoold.service
+
+        - name: Remove s2t config directory
+          file:
+            path: /etc/s2t
+            state: absent
+
+        - name: Remove tmpfiles config for /run/opengl-driver/lib (NVIDIA)
+          file:
+            path: /etc/tmpfiles.d/s2t-opengl-driver.conf
+            state: absent
+
+        - name: Remove keyd config
+          file:
+            path: /etc/keyd/default.conf
+            state: absent
+          # Warning: this might remove user's custom config if they overwrote it.
+          # But install script overwrites it too.
+
+        - name: Reload systemd (best-effort)
+          command: systemctl daemon-reload --timeout=30s
+          register: s2t_daemon_reload
+          retries: 5
+          delay: 2
+          until: s2t_daemon_reload.rc == 0
+          failed_when: false
+          changed_when: false
+      become: true

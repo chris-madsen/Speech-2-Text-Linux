@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=S2T environment import
+Comment=Import DISPLAY/WAYLAND_DISPLAY/XAUTHORITY into systemd --user for S2T services
+Exec=/bin/sh -lc 'systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_SESSION_TYPE DBUS_SESSION_BUS_ADDRESS; dbus-update-activation-environment --systemd DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_SESSION_TYPE DBUS_SESSION_BUS_ADDRESS >/dev/null 2>&1 || true'
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
+

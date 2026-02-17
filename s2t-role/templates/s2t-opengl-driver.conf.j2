@@ -1,0 +1,18 @@
+# Expose NVIDIA driver libraries to Nix-built binaries.
+#
+# Nix packages (like whisper.cpp) often look for GPU driver libs in:
+#   /run/opengl-driver/lib
+#
+# On non-NixOS systems this directory usually does not exist, so CUDA backends
+# fail to load `libcuda.so.1` and fall back to CPU.
+#
+# This tmpfiles.d config creates the directory and symlinks required libs from
+# the host NVIDIA driver installation.
+
+d /run/opengl-driver 0755 root root - -
+d /run/opengl-driver/lib 0755 root root - -
+
+L+ /run/opengl-driver/lib/libcuda.so.1 - - - - {{ s2t_nvidia_driver_libdir }}/libcuda.so.1
+L+ /run/opengl-driver/lib/libnvidia-ml.so.1 - - - - {{ s2t_nvidia_driver_libdir }}/libnvidia-ml.so.1
+L+ /run/opengl-driver/lib/libnvidia-ptxjitcompiler.so.1 - - - - {{ s2t_nvidia_driver_libdir }}/libnvidia-ptxjitcompiler.so.1
+

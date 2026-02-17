@@ -1,0 +1,57 @@
+---
+- name: Prepare
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+      changed_when: false
+
+    - name: Install dependencies
+      apt:
+        name: [sudo, python3, dbus]
+        state: present
+
+    # Ensure groups exist (input, video, audio might be missing in docker)
+    - name: Create required groups
+      group:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - input
+        - video
+        - audio
+
+    - name: Create fake /nix/store
+      file:
+        path: /nix/store
+        state: directory
+        mode: '0755'
+
+    - name: Mock nix command
+      copy:
+        dest: /usr/bin/nix
+        mode: '0755'
+        content: |
+          #!/bin/sh
+          if [ "$1" = "build" ]; then
+             mkdir -p ./result/bin
+             touch ./result/bin/s2t-controller
+             touch ./result/bin/s2t-monitor
+             touch ./result/bin/keyd
+             touch ./result/bin/ydotoold
+             chmod +x ./result/bin/s2t-controller
+             chmod +x ./result/bin/s2t-monitor
+             chmod +x ./result/bin/keyd
+             chmod +x ./result/bin/ydotoold
+          fi
+          exit 0
+
+    - name: Mock gnome-extensions
+      copy:
+        dest: /usr/bin/gnome-extensions
+        mode: '0755'
+        content: |
+          #!/bin/sh
+          exit 0

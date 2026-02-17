@@ -1,0 +1,12 @@
+---
+- name: Converge
+  hosts: all
+  vars:
+    ansible_user_id: root
+    ansible_user_uid: 0
+    s2t_skip_service_enable: true
+    s2t_skip_model_download: true
+  tasks:
+    - name: Include s2t-role
+      include_role:
+        name: s2t_role

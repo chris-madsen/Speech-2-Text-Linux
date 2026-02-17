@@ -1,0 +1,7 @@
+{
+  "name": "S2T Toggle",
+  "description": "Toggle Speech-to-Text recording",
+  "uuid": "s2t-toggle@local",
+  "shell-version": [ "42", "43", "44", "45", "46", "47" ],
+  "url": "https://example.com"
+}

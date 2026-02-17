@@ -1,0 +1,595 @@
+---
+# S2T Ansible Role
+
+- name: Resolve S2T target user
+  become: false
+  set_fact:
+    s2t_target_user: >-
+      {{
+        (
+          ansible_user_id == 'root'
+          and (ansible_env.SUDO_USER | default('') | trim | length > 0)
+          and (ansible_env.SUDO_USER != 'root')
+        ) | ternary(ansible_env.SUDO_USER, ansible_user_id)
+      }}
+  changed_when: false
+
+- name: Resolve S2T target user account details
+  become: false
+  command: "getent passwd {{ s2t_target_user }}"
+  register: s2t_target_passwd_entry
+  changed_when: false
+
+- name: Set S2T target home and uid
+  become: false
+  set_fact:
+    s2t_target_uid: "{{ (s2t_target_passwd_entry.stdout.split(':')[2]) | int }}"
+    s2t_target_home: "{{ s2t_target_passwd_entry.stdout.split(':')[5] }}"
+  changed_when: false
+
+- name: Check passwordless sudo availability
+  become: false
+  command: sudo -n true
+  register: s2t_sudo_check
+  changed_when: false
+  failed_when: false
+  when: ansible_user_id != "root"
+
+- name: Fail when sudo password is required
+  fail:
+    msg: >-
+      This installer requires passwordless sudo in non-interactive mode.
+      Please run `sudo -v` in your terminal or configure sudo for this user,
+      then re-run install.yml.
+  when:
+    - ansible_user_id != "root"
+    - s2t_sudo_check.rc != 0
+
+- name: Locate nix binary
+  shell: |
+    set -euo pipefail
+    if command -v nix >/dev/null 2>&1; then
+      command -v nix
+      exit 0
+    fi
+    for p in /nix/var/nix/profiles/default/bin/nix /root/.nix-profile/bin/nix; do
+      if [ -x "$p" ]; then
+        echo "$p"
+        exit 0
+      fi
+    done
+    exit 1
+  args:
+    executable: /bin/bash
+  register: s2t_nix_lookup
+  changed_when: false
+  failed_when: s2t_nix_lookup.rc not in [0, 1]
+
+- name: Fail if Nix is not installed
+  fail:
+    msg: >-
+      Nix is required for this role but the 'nix' binary was not found.
+      Install Nix or add it to PATH (expected locations include
+      /nix/var/nix/profiles/default/bin/nix and ~/.nix-profile/bin/nix).
+  when: s2t_nix_lookup.rc != 0
+
+- name: Set nix binary path
+  set_fact:
+    s2t_nix_bin: "{{ s2t_nix_lookup.stdout | trim }}"
+
+- name: Create s2t config directory
+  file:
+    path: /etc/s2t
+    state: directory
+    mode: '0755'
+
+- name: Create s2t scripts directory
+  file:
+    path: /etc/s2t/scripts
+    state: directory
+    mode: '0755'
+
+- name: Copy Flake definition
+  copy:
+    src: "flake.nix"
+    dest: "/etc/s2t/flake.nix"
+    mode: '0644'
+
+- name: Copy Flake lockfile
+  copy:
+    src: "flake.lock"
+    dest: "/etc/s2t/flake.lock"
+    mode: '0644'
+
+- name: Copy scripts
+  copy:
+    src: "scripts/{{ item }}"
+    dest: "/etc/s2t/scripts/{{ item }}"
+    mode: '0755'
+  loop:
+    - controller.sh
+    - monitor.py
+    - whisper_server.sh
+  notify: Restart S2T Whisper (User)
+
+- name: Install default S2T env file (does not overwrite)
+  copy:
+    src: "s2t.env"
+    dest: "/etc/s2t/s2t.env"
+    mode: "0644"
+    force: false
+
+- name: Make /etc/s2t/s2t.env editable without sudo (group writable)
+  file:
+    path: "/etc/s2t/s2t.env"
+    owner: "root"
+    group: "{{ s2t_target_user }}"
+    mode: "0664"
+  become: true
+
+- name: Compute default model settings (for explicit config)
+  set_fact:
+    s2t_default_model_filename: "ggml-{{ s2t_default_model }}.bin"
+    s2t_default_model_path_effective: "{{ s2t_target_home }}/.local/share/s2t/ggml-{{ s2t_default_model }}.bin"
+    s2t_default_model_url_effective: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{{ s2t_default_model }}.bin"
+    s2t_default_model_preset_effective: >-
+      {{
+        (s2t_default_model == 'tiny') | ternary('fast',
+          (s2t_default_model == 'small') | ternary('balanced',
+            (s2t_default_model == 'medium') | ternary('medium', 'accurate')))
+      }}
+  changed_when: false
+
+- name: Check if S2T model preset is explicitly set
+  command: grep -qE '^S2T_MODEL_PRESET=' /etc/s2t/s2t.env
+  register: s2t_has_model_preset
+  changed_when: false
+  failed_when: false
+
+- name: Check if S2T model path is explicitly set
+  command: grep -qE '^S2T_MODEL_PATH=' /etc/s2t/s2t.env
+  register: s2t_has_model_path
+  changed_when: false
+  failed_when: false
+
+- name: Check if S2T model url is explicitly set
+  command: grep -qE '^S2T_MODEL_URL=' /etc/s2t/s2t.env
+  register: s2t_has_model_url
+  changed_when: false
+  failed_when: false
+
+- name: Set default S2T_MODEL_PRESET in /etc/s2t/s2t.env (if missing)
+  lineinfile:
+    path: "/etc/s2t/s2t.env"
+    regexp: '^S2T_MODEL_PRESET='
+    line: "S2T_MODEL_PRESET={{ s2t_default_model_preset_effective }}"
+    insertafter: EOF
+  become: true
+  notify: Restart S2T Whisper (User)
+  when: s2t_has_model_preset.rc != 0
+
+- name: Set default S2T_MODEL_PATH in /etc/s2t/s2t.env (if missing)
+  lineinfile:
+    path: "/etc/s2t/s2t.env"
+    regexp: '^S2T_MODEL_PATH='
+    line: "S2T_MODEL_PATH={{ s2t_default_model_path_effective }}"
+    insertafter: EOF
+  become: true
+  notify: Restart S2T Whisper (User)
+  when: s2t_has_model_path.rc != 0
+
+- name: Set default S2T_MODEL_URL in /etc/s2t/s2t.env (if missing)
+  lineinfile:
+    path: "/etc/s2t/s2t.env"
+    regexp: '^S2T_MODEL_URL='
+    line: "S2T_MODEL_URL={{ s2t_default_model_url_effective }}"
+    insertafter: EOF
+  become: true
+  notify: Restart S2T Whisper (User)
+  when: s2t_has_model_url.rc != 0
+
+- name: Set S2T_MODEL_PRESET in /etc/s2t/s2t.env (optional override)
+  lineinfile:
+    path: "/etc/s2t/s2t.env"
+    regexp: '^#?\s*S2T_MODEL_PRESET='
+    line: "S2T_MODEL_PRESET={{ s2t_env_model_preset }}"
+  become: true
+  notify: Restart S2T Whisper (User)
+  when: s2t_env_model_preset | length > 0
+
+- name: Set S2T_MODEL_PATH in /etc/s2t/s2t.env (optional override)
+  lineinfile:
+    path: "/etc/s2t/s2t.env"
+    regexp: '^#?\s*S2T_MODEL_PATH='
+    line: "S2T_MODEL_PATH={{ s2t_env_model_path }}"
+  become: true
+  notify: Restart S2T Whisper (User)
+  when: s2t_env_model_path | length > 0
+
+- name: Set S2T_MODEL_URL in /etc/s2t/s2t.env (optional override)
+  lineinfile:
+    path: "/etc/s2t/s2t.env"
+    regexp: '^#?\s*S2T_MODEL_URL='
+    line: "S2T_MODEL_URL={{ s2t_env_model_url }}"
+  become: true
+  notify: Restart S2T Whisper (User)
+  when: s2t_env_model_url | length > 0
+
+- name: Ensure default model directory exists (user)
+  file:
+    path: "{{ s2t_target_home }}/.local/share/s2t"
+    state: directory
+    mode: "0755"
+  become_user: "{{ s2t_target_user }}"
+  environment:
+    HOME: "{{ s2t_target_home }}"
+    XDG_DATA_HOME: "{{ s2t_target_home }}/.local/share"
+  when: not s2t_skip_model_download
+
+- name: Download default model (user, best effort)
+  get_url:
+    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{{ s2t_default_model }}.bin"
+    dest: "{{ s2t_target_home }}/.local/share/s2t/ggml-{{ s2t_default_model }}.bin"
+    mode: "0644"
+    timeout: "{{ s2t_model_download_timeout }}"
+  become_user: "{{ s2t_target_user }}"
+  environment:
+    HOME: "{{ s2t_target_home }}"
+    XDG_DATA_HOME: "{{ s2t_target_home }}/.local/share"
+  register: s2t_model_download
+  retries: "{{ s2t_model_download_retries }}"
+  delay: "{{ s2t_model_download_delay }}"
+  until: s2t_model_download is succeeded
+  failed_when: s2t_model_download_strict and (s2t_model_download is failed)
+  when: not s2t_skip_model_download
+
+- name: Warn when model download failed and strict mode is disabled
+  debug:
+    msg: >-
+      Model download timed out/failed after retries, continuing because
+      s2t_model_download_strict=false. The runtime whisper service will try to
+      download the model on first start. Failing URL:
+      https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{{ s2t_default_model }}.bin
+  when:
+    - not s2t_skip_model_download
+    - s2t_model_download is failed
+    - not s2t_model_download_strict
+
+- name: Remove previous build result link
+  file:
+    path: /etc/s2t/result
+    state: absent
+  changed_when: false
+
+- name: Detect NVIDIA GPU (for CUDA build)
+  command: nvidia-smi -L
+  register: s2t_nvidia_smi
+  changed_when: false
+  failed_when: false
+
+- name: Set CUDA force MMQ flag (auto for GTX 16xx; overridable)
+  set_fact:
+    s2t_cuda_force_mmq_effective: >-
+      {{
+        (s2t_cuda_force_mmq | length > 0) | ternary(
+          s2t_cuda_force_mmq,
+          (((s2t_nvidia_smi.stdout is search('GTX 16')) or (s2t_nvidia_smi.stdout is search('1660'))) | ternary('1', ''))
+        )
+      }}
+  changed_when: false
+  when:
+    - s2t_enable_cuda
+    - s2t_nvidia_smi.rc == 0
+
+- name: Attempt CUDA build when NVIDIA GPU is present
+  command: "{{ s2t_nix_bin }} build --impure .#cuda --extra-experimental-features \"nix-command flakes\""
+  args:
+    chdir: /etc/s2t
+  environment:
+    S2T_CUDA_ARCH: "{{ s2t_cuda_arch }}"
+    S2T_CUDA_FORCE_MMQ: "{{ s2t_cuda_force_mmq_effective | default('') }}"
+  changed_when: false
+  register: s2t_cuda_build
+  failed_when: false
+  when:
+    - s2t_enable_cuda
+    - s2t_nvidia_smi.rc == 0
+
+- name: Build Nix environment (CPU fallback; produces ./result symlink)
+  command: "{{ s2t_nix_bin }} build . --extra-experimental-features \"nix-command flakes\""
+  args:
+    chdir: /etc/s2t
+  changed_when: false
+  register: s2t_cpu_build
+  failed_when: false
+  when: (not s2t_enable_cuda) or (s2t_nvidia_smi.rc != 0) or (s2t_cuda_build.rc != 0)
+
+- name: Verify build result
+  stat:
+    path: /etc/s2t/result/bin/s2t-controller
+  register: build_check
+
+- name: Fail if build failed
+  fail:
+    msg: "Nix build failed."
+  when: not build_check.stat.exists
+
+# --- GPU DRIVER LIBS (non-NixOS) ---
+
+- name: Detect NVIDIA driver library directory
+  block:
+    - name: Check /usr/lib/x86_64-linux-gnu for libcuda
+      stat:
+        path: /usr/lib/x86_64-linux-gnu/libcuda.so.1
+      register: s2t_libcuda_usr
+
+    - name: Check /lib/x86_64-linux-gnu for libcuda
+      stat:
+        path: /lib/x86_64-linux-gnu/libcuda.so.1
+      register: s2t_libcuda_lib
+
+    - name: Set NVIDIA driver libdir fact
+      set_fact:
+        s2t_nvidia_driver_libdir: >-
+          {{
+            (s2t_nvidia_driver_libdir | length > 0) | ternary(
+              s2t_nvidia_driver_libdir,
+              (s2t_libcuda_usr.stat.exists | ternary('/usr/lib/x86_64-linux-gnu',
+                (s2t_libcuda_lib.stat.exists | ternary('/lib/x86_64-linux-gnu', ''))))
+            )
+          }}
+      changed_when: false
+
+- name: Install tmpfiles config for /run/opengl-driver/lib (NVIDIA)
+  template:
+    src: "s2t-opengl-driver.conf.j2"
+    dest: "/etc/tmpfiles.d/s2t-opengl-driver.conf"
+    mode: "0644"
+  become: true
+  when: s2t_nvidia_driver_libdir | length > 0
+
+- name: Apply tmpfiles rules (create /run/opengl-driver/lib symlinks)
+  command: systemd-tmpfiles --create /etc/tmpfiles.d/s2t-opengl-driver.conf
+  become: true
+  changed_when: false
+  failed_when: false
+  when: s2t_nvidia_driver_libdir | length > 0
+
+# --- KEYD SETUP ---
+
+- name: Create keyd config directory
+  file:
+    path: /etc/keyd
+    state: directory
+    mode: '0755'
+
+- name: Install keyd config
+  copy:
+    src: "keyd.conf"
+    dest: "/etc/keyd/default.conf"
+    mode: '0644'
+  notify: Restart Keyd
+
+- name: Install keyd service unit
+  copy:
+    src: "keyd.service"
+    dest: "/etc/systemd/system/keyd.service"
+    mode: '0644'
+  notify: Reload Systemd
+
+- name: Ensure udev rules directory exists
+  file:
+    path: "/etc/udev/rules.d"
+    state: directory
+    mode: "0755"
+
+- name: Install udev rule for keyd virtual devices
+  copy:
+    src: "72-s2t-keyd-seat.rules"
+    dest: "/etc/udev/rules.d/72-s2t-keyd-seat.rules"
+    mode: "0644"
+  notify:
+    - Reload udev rules
+    - Restart Keyd
+
+- name: Remove legacy udev rule (pre-seat assignment)
+  file:
+    path: "/etc/udev/rules.d/99-s2t-keyd-uaccess.rules"
+    state: absent
+  notify: Reload udev rules
+
+- name: Enable and start keyd
+  systemd:
+    name: keyd
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  when: not s2t_skip_service_enable
+
+# --- YDOTOOL SETUP ---
+
+- name: Install ydotool service unit
+  copy:
+    src: "ydotoold.service"
+    dest: "/etc/systemd/system/ydotoold.service"
+    mode: '0644'
+  notify: Reload Systemd
+
+- name: Enable and start ydotoold
+  systemd:
+    name: ydotoold
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  when: not s2t_skip_service_enable
+
+# --- USER SETUP ---
+
+- name: Add user to input group (for keyd/ydotool access)
+  user:
+    name: "{{ s2t_target_user }}"
+    groups: input,video,audio
+    append: yes
+
+# --- MONITOR SERVICE ---
+
+- name: Enable lingering for target user (autostart user services after boot)
+  command: "loginctl enable-linger {{ s2t_target_user }}"
+  register: s2t_enable_linger
+  changed_when: false
+  failed_when: false
+  when: not s2t_skip_service_enable
+
+- name: Warn when linger enabling failed
+  debug:
+    msg: >-
+      Could not enable linger for {{ s2t_target_user }} (rc={{ s2t_enable_linger.rc }}).
+      User services will autostart only after user login.
+  when:
+    - not s2t_skip_service_enable
+    - s2t_enable_linger is defined
+    - s2t_enable_linger.rc != 0
+
+- name: Install s2t-monitor service unit directory
+  file:
+    path: "{{ s2t_target_home }}/.config/systemd/user"
+    state: directory
+    owner: "{{ s2t_target_user }}"
+    group: "{{ s2t_target_user }}"
+    mode: '0755'
+
+- name: Ensure per-user s2t config directory exists
+  file:
+    path: "{{ s2t_target_home }}/.config/s2t"
+    state: directory
+    owner: "{{ s2t_target_user }}"
+    group: "{{ s2t_target_user }}"
+    mode: "0700"
+
+- name: Install per-user override env file (does not overwrite)
+  copy:
+    src: "s2t.user.env"
+    dest: "{{ s2t_target_home }}/.config/s2t/s2t.env"
+    owner: "{{ s2t_target_user }}"
+    group: "{{ s2t_target_user }}"
+    mode: "0644"
+    force: false
+
+- name: Install per-user secrets env file (does not overwrite)
+  copy:
+    src: "s2t.secrets.env"
+    dest: "{{ s2t_target_home }}/.config/s2t/secrets.env"
+    owner: "{{ s2t_target_user }}"
+    group: "{{ s2t_target_user }}"
+    mode: "0600"
+    force: false
+
+- name: Copy whisper server unit
+  copy:
+    src: "s2t-whisper.service"
+    dest: "{{ s2t_target_home }}/.config/systemd/user/s2t-whisper.service"
+    owner: "{{ s2t_target_user }}"
+    group: "{{ s2t_target_user }}"
+    mode: '0644'
+  notify: Reload Systemd
+
+- name: Copy monitor unit
+  copy:
+    src: "s2t-monitor.service"
+    dest: "{{ s2t_target_home }}/.config/systemd/user/s2t-monitor.service"
+    owner: "{{ s2t_target_user }}"
+    group: "{{ s2t_target_user }}"
+    mode: '0644'
+  notify: Reload Systemd
+
+- name: Check if systemd user bus is available
+  stat:
+    path: "/run/user/{{ s2t_target_uid }}/bus"
+  register: s2t_user_bus
+  changed_when: false
+  when: not s2t_skip_service_enable
+
+- name: Explain how to enable s2t-monitor when no user session is available
+  debug:
+    msg: "Skipping enabling s2t services (systemd --user bus not available). Log in as '{{ s2t_target_user }}' and run: systemctl --user enable --now s2t-whisper s2t-monitor"
+  when:
+    - not s2t_skip_service_enable
+    - not s2t_user_bus.stat.exists
+
+- name: Enable s2t-whisper user service
+  systemd:
+    name: s2t-whisper
+    scope: user
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become_user: "{{ s2t_target_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
+  when:
+    - not s2t_skip_service_enable
+    - s2t_user_bus.stat.exists
+
+- name: Enable s2t-monitor user service
+  systemd:
+    name: s2t-monitor
+    scope: user
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become_user: "{{ s2t_target_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
+  when:
+    - not s2t_skip_service_enable
+    - s2t_user_bus.stat.exists
+
+# --- GNOME EXTENSION ---
+
+- name: Create extensions directory
+  file:
+    path: "{{ s2t_target_home }}/.local/share/gnome-shell/extensions/s2t-toggle@local"
+    state: directory
+    mode: '0755'
+    owner: "{{ s2t_target_user }}"
+    group: "{{ s2t_target_user }}"
+
+- name: Install extension files
+  copy:
+    src: "gnome-extension/{{ item }}"
+    dest: "{{ s2t_target_home }}/.local/share/gnome-shell/extensions/s2t-toggle@local/{{ item }}"
+    mode: '0644'
+    owner: "{{ s2t_target_user }}"
+    group: "{{ s2t_target_user }}"
+  loop:
+    - metadata.json
+    - extension.js
+
+- name: Ensure autostart directory exists
+  file:
+    path: "{{ s2t_target_home }}/.config/autostart"
+    state: directory
+    mode: "0755"
+    owner: "{{ s2t_target_user }}"
+    group: "{{ s2t_target_user }}"
+  when: not s2t_skip_service_enable
+
+- name: Install autostart entry to import graphical session env into systemd user
+  copy:
+    src: "s2t-env-import.desktop"
+    dest: "{{ s2t_target_home }}/.config/autostart/s2t-env-import.desktop"
+    mode: "0644"
+    owner: "{{ s2t_target_user }}"
+    group: "{{ s2t_target_user }}"
+  when: not s2t_skip_service_enable
+
+- name: Enable GNOME extension
+  command: gnome-extensions enable s2t-toggle@local
+  become_user: "{{ s2t_target_user }}"
+  environment:
+    HOME: "{{ s2t_target_home }}"
+    XDG_DATA_HOME: "{{ s2t_target_home }}/.local/share"
+  register: s2t_gnome_enable
+  changed_when: false
+  failed_when: false
+  when: not s2t_skip_service_enable

@@ -1,0 +1,23 @@
+galaxy_info:
+  author: Codex
+  role_name: s2t_role
+  namespace: codex
+  description: Local Speech-to-Text with push-to-talk and GNOME integration (Nix-based)
+  company: OpenAI
+  license: MIT
+  min_ansible_version: 2.9
+  platforms:
+    - name: Ubuntu
+      versions:
+        - focal
+        - jammy
+    - name: Pop!_OS
+      versions:
+        - all
+  galaxy_tags:
+    - speech-to-text
+    - nix
+    - gnome
+    - keyd
+
+dependencies: []

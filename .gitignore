@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+
+# Ansible / Molecule local artifacts
+*.retry
+.molecule/
+
+# Nix local build outputs
+result
+result-*/
+.direnv/
+
+# Local runtime/cache
+.cache/
+tmp/
+
+# Editor / OS files
+.idea/
+.vscode/
+*~
+.DS_Store

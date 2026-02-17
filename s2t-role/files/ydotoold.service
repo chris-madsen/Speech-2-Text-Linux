@@ -1,0 +1,12 @@
+[Unit]
+Description=ydotool daemon
+After=network.target
+
+[Service]
+ExecStart=/bin/sh -lc 'exec /etc/s2t/result/bin/ydotoold --socket-path=/run/ydotool.socket --socket-perm=0660 --socket-own=0:$(/usr/bin/getent group input | /usr/bin/cut -d: -f3)'
+
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+# Let systemd-logind apply ACLs (uaccess) for keyd's virtual devices.
+#
+# keyd creates virtual input devices under /devices/virtual that otherwise
+# end up as root:input 0660 without a seat assignment, so the uaccess builtin
+# can't grant access to the active desktop user.
+#
+# We force them onto seat0 so 73-seat-late.rules runs the uaccess builtin.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="keyd virtual keyboard", ENV{ID_SEAT}="seat0", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="keyd virtual pointer",  ENV{ID_SEAT}="seat0", TAG+="uaccess"
+

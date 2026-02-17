@@ -1,0 +1,28 @@
+---
+- name: Reload Systemd
+  systemd:
+    daemon_reload: yes
+  when: not s2t_skip_service_enable
+
+- name: Restart Keyd
+  systemd:
+    name: keyd
+    state: restarted
+    enabled: yes
+  when: not s2t_skip_service_enable
+
+- name: Reload udev rules
+  command: udevadm control --reload-rules
+  when: not s2t_skip_service_enable
+
+- name: Restart S2T Whisper (User)
+  systemd:
+    name: s2t-whisper
+    scope: user
+    state: restarted
+    daemon_reload: yes
+  become_user: "{{ s2t_target_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
+  failed_when: false
+  when: not s2t_skip_service_enable

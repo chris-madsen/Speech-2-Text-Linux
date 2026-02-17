@@ -1,0 +1,11 @@
+[Unit]
+Description=Keyd Daemon
+After=udev.service
+
+[Service]
+ExecStart=/etc/s2t/result/bin/keyd
+Restart=always
+Nice=-15
+
+[Install]
+WantedBy=sysinit.target

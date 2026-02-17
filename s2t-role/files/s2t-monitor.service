@@ -1,0 +1,21 @@
+[Unit]
+Description=S2T Key Monitor (User)
+After=graphical-session.target
+
+[Service]
+ExecStart=/etc/s2t/result/bin/s2t-monitor
+Restart=always
+Environment=YDOTOOL_SOCKET=/run/ydotool.socket
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/s2t/s2t.env
+EnvironmentFile=-%h/.config/s2t/secrets.env
+EnvironmentFile=-%h/.config/s2t/s2t.env
+CPUAccounting=yes
+MemoryAccounting=yes
+TasksAccounting=yes
+CPUQuota=50%
+MemoryMax=256M
+TasksMax=32
+
+[Install]
+WantedBy=default.target

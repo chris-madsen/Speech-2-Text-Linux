@@ -1,0 +1,17 @@
+---
+s2t_skip_service_enable: false
+s2t_enable_cuda: true
+s2t_cuda_arch: ""
+s2t_cuda_force_mmq: ""
+s2t_nvidia_driver_libdir: ""
+s2t_skip_model_download: false
+s2t_model_download_timeout: 120
+s2t_model_download_retries: 3
+s2t_model_download_delay: 5
+s2t_model_download_strict: false
+s2t_default_model: "small"
+
+# Optional: write explicit overrides into /etc/s2t/s2t.env (non-destructive).
+s2t_env_model_preset: ""
+s2t_env_model_path: ""
+s2t_env_model_url: ""

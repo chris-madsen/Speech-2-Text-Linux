@@ -1,0 +1,22 @@
+[Unit]
+Description=S2T Whisper Server (User)
+After=graphical-session.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/s2t/s2t.env
+EnvironmentFile=-%h/.config/s2t/secrets.env
+EnvironmentFile=-%h/.config/s2t/s2t.env
+ExecStart=/etc/s2t/scripts/whisper_server.sh
+Restart=always
+RestartSec=1
+CPUAccounting=yes
+MemoryAccounting=yes
+TasksAccounting=yes
+CPUQuota=350%
+MemoryHigh=2500M
+MemoryMax=3G
+TasksMax=64
+
+[Install]
+WantedBy=default.target

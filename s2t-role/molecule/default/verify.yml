@@ -1,0 +1,60 @@
+---
+- name: Verify
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Check /etc/s2t/flake.nix
+      stat: path=/etc/s2t/flake.nix
+      register: res
+    - assert: { that: res.stat.exists }
+
+    - name: Check keyd config
+      slurp: src=/etc/keyd/default.conf
+      register: keyd_conf
+    - assert:
+        that:
+          - "'rightalt = f24' in keyd_conf['content'] | b64decode"
+
+    - name: Check systemd user service installed
+      stat: path=/root/.config/systemd/user/s2t-monitor.service
+      register: svc_monitor
+    - assert: { that: svc_monitor.stat.exists }
+
+    - name: Check whisper server unit installed
+      stat: path=/root/.config/systemd/user/s2t-whisper.service
+      register: svc_whisper
+    - assert: { that: svc_whisper.stat.exists }
+
+    - name: Check udev rule installed
+      stat: path=/etc/udev/rules.d/72-s2t-keyd-seat.rules
+      register: udev_rule
+    - assert: { that: udev_rule.stat.exists }
+
+    - name: Check if host has NVIDIA libcuda (for tmpfiles expectation)
+      stat:
+        path: /usr/lib/x86_64-linux-gnu/libcuda.so.1
+      register: libcuda_usr
+
+    - name: Check if host has NVIDIA libcuda in /lib
+      stat:
+        path: /lib/x86_64-linux-gnu/libcuda.so.1
+      register: libcuda_lib
+
+    - name: Check tmpfiles config installed when libcuda exists
+      stat:
+        path: /etc/tmpfiles.d/s2t-opengl-driver.conf
+      register: tmpfiles_conf
+
+    - assert:
+        that:
+          - "(not libcuda_usr.stat.exists) or tmpfiles_conf.stat.exists"
+          - "(not libcuda_lib.stat.exists) or tmpfiles_conf.stat.exists"
+
+    - name: Verify systemd unit files parse cleanly
+      command: systemd-analyze verify /etc/systemd/system/keyd.service /etc/systemd/system/ydotoold.service /root/.config/systemd/user/s2t-whisper.service /root/.config/systemd/user/s2t-monitor.service
+      register: unit_verify
+      changed_when: false
+
+    - assert:
+        that:
+          - unit_verify.rc == 0
