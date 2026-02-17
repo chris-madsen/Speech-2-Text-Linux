@@ -189,6 +189,12 @@ test_linger_autostart_setup() {
   assert_contains "$tasks_main" "loginctl enable-linger"
 }
 
+test_user_env_is_authoritative() {
+  assert_contains "$tasks_main" "Install per-user override env file"
+  assert_contains "$tasks_main" "force: \"\\{\\{ s2t_user_env_force \\}\\}\""
+  assert_contains "$repo_root/s2t-role/defaults/main.yml" "^s2t_user_env_force: true"
+}
+
 test_model_download_best_effort() {
   assert_contains "$tasks_main" "Download default model \\(user, best effort\\)"
   assert_contains "$tasks_main" "s2t_model_download_retries"
@@ -542,6 +548,7 @@ run_test() {
 run_test "ansible sudo precheck" test_ansible_sudo_precheck
 run_test "target user resolution" test_target_user_resolution
 run_test "linger autostart setup" test_linger_autostart_setup
+run_test "user env authoritative" test_user_env_is_authoritative
 run_test "model download best effort" test_model_download_best_effort
 run_test "paste fallback default" test_paste_fallback_default
 run_test "max record limit support" test_max_record_limit_support

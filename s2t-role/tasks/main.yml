@@ -466,14 +466,14 @@
     group: "{{ s2t_target_user }}"
     mode: "0700"
 
-- name: Install per-user override env file (does not overwrite)
+- name: Install per-user override env file
   copy:
     src: "s2t.user.env"
     dest: "{{ s2t_target_home }}/.config/s2t/s2t.env"
     owner: "{{ s2t_target_user }}"
     group: "{{ s2t_target_user }}"
     mode: "0644"
-    force: false
+    force: "{{ s2t_user_env_force }}"
 
 - name: Install per-user secrets env file (does not overwrite)
   copy:

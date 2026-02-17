@@ -10,6 +10,7 @@ s2t_model_download_retries: 3
 s2t_model_download_delay: 5
 s2t_model_download_strict: false
 s2t_default_model: "small"
+s2t_user_env_force: true
 
 # Optional: write explicit overrides into /etc/s2t/s2t.env (non-destructive).
 s2t_env_model_preset: ""
