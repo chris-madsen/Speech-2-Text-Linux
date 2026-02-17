@@ -1,120 +1,159 @@
-S2T (speech-to-text) - local + cloud setup
-==========================================
+= S2T (Speech-to-Text)
 
-Overview
---------
-This project installs and manages an S2T stack with:
-- key monitor service (F24 press/release)
-- whisper-server user service (model kept in memory)
-- cloud ASR support (Google/OpenAI)
-- local fallback via whisper-server/whisper-cli
-- Ansible-based install/uninstall
+== What This Project Is
+S2T is a desktop speech-to-text stack for Linux.
+It lets you hold a hotkey, speak, and insert recognized text into the focused app.
+The project is intended for daily dictation workflows where latency and reliability matter.
 
-Quick start
------------
-1. Prepare tools:
-   - ansible-playbook
-   - nix
-2. Warm up sudo in terminal:
-   sudo -v
-3. Install:
-   make install
+== Why It Exists
+This repository provides:
 
-Main commands
--------------
-- Install:
-  make install
-- Uninstall:
-  make uninstall
-- Playbook checks:
-  make test-playbooks
-- Full tests:
-  make test
+* reproducible install and uninstall via Ansible
+* cloud-first recognition (Google/OpenAI)
+* local fallback (whisper-server / whisper-cli) when cloud fails
+* persistent whisper model in memory for faster local fallback
+* systemd user services with cgroup limits and log rotation controls
 
-Services
---------
+== Architecture
+Main components:
+
+* `s2t-monitor.service`: listens for key events and starts/stops recording
+* `s2t-whisper.service`: runs `whisper-server` and keeps model loaded
+* `s2t-controller`: records audio, calls ASR provider, inserts text, writes logs
+
+== Quick Start
+. Requirements:
+* `ansible-playbook`
+* `nix`
+
+. Warm up sudo:
+----
+sudo -v
+----
+
+. Install:
+----
+make install
+----
+
+== Main Commands
+* Install:
+----
+make install
+----
+* Uninstall:
+----
+make uninstall
+----
+* Playbook checks:
+----
+make test-playbooks
+----
+* Full tests:
+----
+make test
+----
+
+== Services
 User services:
-- s2t-monitor.service
-- s2t-whisper.service
+
+* `s2t-monitor.service`
+* `s2t-whisper.service`
 
 Useful commands:
-- List:
-  systemctl --user list-units --type=service | rg s2t
-- Status:
-  systemctl --user status s2t-monitor.service
-  systemctl --user status s2t-whisper.service
-- Restart:
-  systemctl --user restart s2t-monitor.service s2t-whisper.service
 
-Autostart
----------
+* List:
+----
+systemctl --user list-units --type=service | rg s2t
+----
+* Status:
+----
+systemctl --user status s2t-monitor.service
+systemctl --user status s2t-whisper.service
+----
+* Restart:
+----
+systemctl --user restart s2t-monitor.service s2t-whisper.service
+----
+
+== Autostart
 Autostart is enabled by:
-- systemctl --user enable s2t-monitor s2t-whisper
-- linger for target user (loginctl enable-linger <user>)
 
-Configuration
--------------
+* `systemctl --user enable s2t-monitor s2t-whisper`
+* user linger: `loginctl enable-linger <user>`
+
+== Configuration
 System defaults:
-- /etc/s2t/s2t.env
+
+* `/etc/s2t/s2t.env`
 
 Per-user overrides:
-- ~/.config/s2t/s2t.env
-- ~/.config/s2t/secrets.env
 
-Current important variables:
-- S2T_ASR_PROVIDER=google|openai|google-v2|local
-- S2T_USE_SERVER=1
-- S2T_NETWORK_ONLY=0|1
-- S2T_MAX_RESPONSE_SECONDS=5
-- S2T_GOOGLE_TIMEOUT_SEC=4
-- S2T_MODEL_PATH=/home/<user>/.local/share/s2t/ggml-*.bin
+* `~/.config/s2t/s2t.env`
+* `~/.config/s2t/secrets.env`
 
-ASR behavior
-------------
-- Cloud-first:
-  set S2T_ASR_PROVIDER to google/openai/google-v2.
-- Local fallback enabled:
-  S2T_NETWORK_ONLY=0
-- Strict cloud-only (no local fallback):
-  S2T_NETWORK_ONLY=1
+Important variables:
 
-Logs
+* `S2T_ASR_PROVIDER=google|openai|google-v2|local`
+* `S2T_USE_SERVER=1`
+* `S2T_NETWORK_ONLY=0|1`
+* `S2T_MAX_RESPONSE_SECONDS=5`
+* `S2T_GOOGLE_TIMEOUT_SEC=4`
+* `S2T_MODEL_PATH=/home/<user>/.local/share/s2t/ggml-*.bin`
+
+== ASR Behavior
+* Cloud-first: set `S2T_ASR_PROVIDER` to `google`/`openai`/`google-v2`
+* Local fallback enabled: `S2T_NETWORK_ONLY=0`
+* Strict cloud-only mode: `S2T_NETWORK_ONLY=1`
+
+== Logs
+* Runtime log:
 ----
-- Runtime log:
-  /run/user/$(id -u)/s2t/s2t.log
-- Monitor journal:
-  journalctl --user -u s2t-monitor.service -f
-- Whisper journal:
-  journalctl --user -u s2t-whisper.service -f
+/run/user/$(id -u)/s2t/s2t.log
+----
+* Monitor journal:
+----
+journalctl --user -u s2t-monitor.service -f
+----
+* Whisper journal:
+----
+journalctl --user -u s2t-whisper.service -f
+----
 
-Log growth control is handled by controller variables:
-- S2T_LOG_MAX_BYTES
-- S2T_LOG_KEEP
-- S2T_WHISPER_ARTIFACT_KEEP
-- S2T_WHISPER_LOG_MAX_BYTES
+Log growth is controlled by:
 
-Resource limits (systemd cgroups)
----------------------------------
+* `S2T_LOG_MAX_BYTES`
+* `S2T_LOG_KEEP`
+* `S2T_WHISPER_ARTIFACT_KEEP`
+* `S2T_WHISPER_LOG_MAX_BYTES`
+
+== Resource Limits (systemd cgroups)
 Configured in user units:
-- s2t-whisper.service:
-  CPUQuota=350%
-  MemoryHigh=2500M
-  MemoryMax=3G
-  TasksMax=64
-- s2t-monitor.service:
-  CPUQuota=50%
-  MemoryMax=256M
-  TasksMax=32
 
-Troubleshooting
----------------
+* `s2t-whisper.service`
+** `CPUQuota=350%`
+** `MemoryHigh=2500M`
+** `MemoryMax=3G`
+** `TasksMax=64`
+* `s2t-monitor.service`
+** `CPUQuota=50%`
+** `MemoryMax=256M`
+** `TasksMax=32`
+
+== Troubleshooting
 If install fails on sudo in non-interactive mode:
-1. Run:
-   sudo -v
-2. Run install again:
-   make install
 
-If cloud ASR is slow/unavailable:
-1. Check runtime log for provider timing and fallback.
-2. Verify provider keys/credentials in secrets file.
-3. Set S2T_NETWORK_ONLY according to expected behavior.
+. Run:
+----
+sudo -v
+----
+. Run install again:
+----
+make install
+----
+
+If cloud ASR is slow or unavailable:
+
+. Check runtime log for provider timing and fallback path.
+. Verify provider keys/credentials in secrets file.
+. Set `S2T_NETWORK_ONLY` to match expected behavior.
