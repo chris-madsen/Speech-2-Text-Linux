@@ -1,0 +1,7 @@
+[Unit]
+Description=S2T Stack (User)
+Wants=s2t-whisper.service s2t-monitor.service s2t-dataset-etl.service s2t-codex-bridge.service s2t-rabbitmq.service s2t-rabbitmq-drain.service
+After=graphical-session.target s2t-rabbitmq.service
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,25 @@
+[Unit]
+Description=S2T Dataset ETL Daemon (User)
+After=graphical-session.target s2t-rabbitmq-drain.service
+Wants=s2t-rabbitmq-drain.service
+PartOf=s2t.target
+
+[Service]
+Type=simple
+ExecStart=/etc/s2t/result/bin/python3 /etc/s2t/scripts/dataset_etl_daemon.py
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/s2t/s2t.env
+EnvironmentFile=-%h/.config/s2t/secrets.env
+EnvironmentFile=-%h/.config/s2t/s2t.env
+CPUAccounting=yes
+MemoryAccounting=yes
+TasksAccounting=yes
+CPUQuota=75%
+MemoryMax=512M
+TasksMax=32
+
+[Install]
+WantedBy=default.target
+WantedBy=s2t.target

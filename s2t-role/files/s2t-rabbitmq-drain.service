@@ -1,0 +1,27 @@
+[Unit]
+Description=S2T RabbitMQ Queue Drain (User)
+After=graphical-session.target s2t-rabbitmq.service
+Requires=s2t-rabbitmq.service
+BindsTo=s2t-rabbitmq.service
+PartOf=s2t.target
+
+[Service]
+Type=simple
+ExecCondition=/bin/bash -lc 'set -euo pipefail; [ "${S2T_QUEUE_BACKEND:-file}" = "rabbitmq" ]'
+ExecStart=/etc/s2t/result/bin/python3 /etc/s2t/scripts/rabbitmq_drain_daemon.py
+Restart=on-failure
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/s2t/s2t.env
+EnvironmentFile=-%h/.config/s2t/secrets.env
+EnvironmentFile=-%h/.config/s2t/s2t.env
+CPUAccounting=yes
+MemoryAccounting=yes
+TasksAccounting=yes
+CPUQuota=25%
+MemoryMax=256M
+TasksMax=32
+
+[Install]
+WantedBy=default.target
+WantedBy=s2t.target

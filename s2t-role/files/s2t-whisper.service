@@ -1,6 +1,7 @@
 [Unit]
 Description=S2T Whisper Server (User)
 After=graphical-session.target
+PartOf=s2t.target
 
 [Service]
 Type=simple
@@ -13,10 +14,13 @@ RestartSec=1
 CPUAccounting=yes
 MemoryAccounting=yes
 TasksAccounting=yes
-CPUQuota=350%
+Nice=10
+CPUQuota=500%
+CPUWeight=25
 MemoryHigh=2500M
 MemoryMax=3G
 TasksMax=64
 
 [Install]
 WantedBy=default.target
+WantedBy=s2t.target

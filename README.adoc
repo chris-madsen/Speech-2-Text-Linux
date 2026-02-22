@@ -19,12 +19,18 @@ Main components:
 
 * `s2t-monitor.service`: listens for key events and starts/stops recording
 * `s2t-whisper.service`: runs `whisper-server` and keeps model loaded
+* `s2t-rabbitmq.service` (Podman): durable queue broker for dataset jobs
+* `s2t-rabbitmq-drain.service`: consumes RabbitMQ jobs and materializes local `.job` files
+* `s2t-dataset-etl.service`: watches correction queue and rebuilds JSONL dataset
+* `s2t-codex-bridge.service`: maps corrected Codex chat text to latest pending audio
+* `s2t.target`: parent unit for the full S2T stack
 * `s2t-controller`: records audio, calls ASR provider, inserts text, writes logs
 
 == Quick Start
 . Requirements:
 * `ansible-playbook`
 * `nix`
+* rootless Podman uidmap helpers (`newuidmap`/`newgidmap`, playbook installs on supported Linux families)
 
 . Warm up sudo:
 ----
@@ -41,9 +47,22 @@ make install
 ----
 make install
 ----
+* Install for a specific user:
+----
+make install S2T_USER=work
+make install S2T_USER=ilja
+----
+* Install for both users:
+----
+make install-both
+----
 * Uninstall:
 ----
 make uninstall
+----
+* Uninstall for both users:
+----
+make uninstall-both
 ----
 * Playbook checks:
 ----
@@ -53,12 +72,21 @@ make test-playbooks
 ----
 make test
 ----
+* Build training dataset (audio+text -> JSONL):
+----
+make dataset-build DATASET_INPUT=data/raw DATASET_OUTPUT=data/dataset DATASET_TEST_RATIO=0.1 DATASET_JOBS=4 DATASET_SEED=42
+----
 
 == Services
 User services:
 
 * `s2t-monitor.service`
 * `s2t-whisper.service`
+* `s2t-rabbitmq.service`
+* `s2t-rabbitmq-drain.service`
+* `s2t-dataset-etl.service`
+* `s2t-codex-bridge.service`
+* `s2t.target`
 
 Useful commands:
 
@@ -70,16 +98,23 @@ systemctl --user list-units --type=service | rg s2t
 ----
 systemctl --user status s2t-monitor.service
 systemctl --user status s2t-whisper.service
+systemctl --user status s2t-rabbitmq.service
+systemctl --user status s2t-rabbitmq-drain.service
+systemctl --user status s2t-dataset-etl.service
+systemctl --user status s2t-codex-bridge.service
+systemctl --user status s2t.target
 ----
 * Restart:
 ----
 systemctl --user restart s2t-monitor.service s2t-whisper.service
+systemctl --user restart s2t-rabbitmq.service s2t-rabbitmq-drain.service
+systemctl --user restart s2t-dataset-etl.service s2t-codex-bridge.service s2t.target
 ----
 
 == Autostart
 Autostart is enabled by:
 
-* `systemctl --user enable s2t-monitor s2t-whisper`
+* `systemctl --user enable s2t-rabbitmq s2t-rabbitmq-drain s2t-whisper s2t-monitor s2t-dataset-etl s2t-codex-bridge s2t.target`
 * user linger: `loginctl enable-linger <user>`
 
 == Configuration
@@ -101,6 +136,70 @@ Important variables:
 * `S2T_GOOGLE_TIMEOUT_SEC=4`
 * `S2T_MODEL_PATH=/home/<user>/.local/share/s2t/ggml-*.bin`
 
+== Dataset Post-processing
+The repository includes an asynchronous post-processing pipeline.
+
+Collection flow:
+
+1. Speak and get transcript in the target app (normal S2T flow).
+2. Manually correct the transcript.
+3. Submit the corrected text (not raw model output):
++
+----
+echo "your corrected text" | s2t-controller submit-correction
+----
+If you work through Codex chat, `s2t-codex-bridge.service` can auto-submit corrected user messages to `submit-correction` when a fresh pending sample exists in the configured window.
+4. If speech was split into multiple short recordings (pause/resume), one `submit-correction` maps the text to the latest contiguous pending audio cluster.
+5. `s2t-dataset-etl.service` consumes queue jobs and rebuilds dataset JSONL asynchronously.
+6. Before ETL, each pair is validated (file checks + optional ASR probe + optional LLM gate via `codex exec`).
+
+Build/transformation pipeline:
+
+* Script: `scripts/build_dataset.py`
+* Input: paired files under one root (`*.wav` + `*.txt` with the same relative stem)
+* Audio transform: ffmpeg re-encode to 16kHz, mono, 16-bit PCM WAV
+* Text transform: control-char cleanup + whitespace normalization
+* Output schema (JSONL): `{"audio":"path","sentence":"text"}`
+* Split: deterministic `train/test` partition using `--test-ratio` and `--seed`
+
+Output files in the target directory:
+
+* `all.jsonl`
+* `train.jsonl`
+* `test.jsonl`
+* `errors.jsonl`
+* `summary.json`
+
+Dataset-related variables:
+
+* `S2T_DATASET_ROOT`
+* `S2T_DATASET_RAW_DIR`
+* `S2T_DATASET_QUEUE_DIR`
+* `S2T_DATASET_OUTPUT_DIR`
+* `S2T_DATASET_ENQUEUE_CORRECTION`
+* `S2T_DATASET_ETL_AUTORUN`
+* `S2T_DATASET_VALIDATE_WITH_LLM`
+* `S2T_DATASET_LLM_VALIDATOR_CMD`
+* `S2T_DATASET_ASR_PROBE_URL`
+* `S2T_DATASET_QUARANTINE_MODE` (`copy` keeps originals in `raw`, `move` relocates them)
+* `S2T_DATASET_CLUSTER_ON_SUBMIT`
+* `S2T_DATASET_MULTI_SEGMENT_GAP_SEC`
+* `S2T_DATASET_MULTI_SEGMENT_MAX_COUNT`
+* `S2T_DATASET_LOG_FILE`
+* `S2T_DATASET_LOG_MAX_BYTES`
+* `S2T_DATASET_LOG_KEEP`
+* `S2T_QUEUE_BACKEND` (`file` or `rabbitmq`)
+* `S2T_RABBITMQ_URL`
+* `S2T_RABBITMQ_QUEUE`
+* `S2T_RABBITMQ_ROUTING_KEY`
+* `S2T_PODMAN_BIN`
+* `S2T_RABBITMQ_IMAGE`
+* `S2T_CODEX_BRIDGE_ENABLED`
+* `S2T_CODEX_BRIDGE_WINDOW_SEC`
+* `S2T_CODEX_BRIDGE_MAX_PENDING_AGE_SEC`
+* `S2T_CODEX_BRIDGE_MIN_SHARED_TOKENS`
+* `S2T_CODEX_BRIDGE_MIN_TOKEN_OVERLAP`
+
 == ASR Behavior
 * Cloud-first: set `S2T_ASR_PROVIDER` to `google`/`openai`/`google-v2`
 * Local fallback enabled: `S2T_NETWORK_ONLY=0`
@@ -111,6 +210,18 @@ Important variables:
 ----
 /run/user/$(id -u)/s2t/s2t.log
 ----
+* Dataset ETL detailed log (default):
+----
+/run/user/$(id -u)/s2t/dataset-etl.log
+----
+* Codex bridge detailed log (default):
+----
+/run/user/$(id -u)/s2t/codex-bridge.log
+----
+* RabbitMQ drain detailed log (default):
+----
+/run/user/$(id -u)/s2t/rabbitmq-drain.log
+----
 * Monitor journal:
 ----
 journalctl --user -u s2t-monitor.service -f
@@ -119,6 +230,19 @@ journalctl --user -u s2t-monitor.service -f
 ----
 journalctl --user -u s2t-whisper.service -f
 ----
+* Dataset ETL journal:
+----
+journalctl --user -u s2t-dataset-etl.service -f
+----
+* Codex bridge journal:
+----
+journalctl --user -u s2t-codex-bridge.service -f
+----
+* RabbitMQ services journal:
+----
+journalctl --user -u s2t-rabbitmq.service -f
+journalctl --user -u s2t-rabbitmq-drain.service -f
+----
 
 Log growth is controlled by:
 
@@ -126,12 +250,14 @@ Log growth is controlled by:
 * `S2T_LOG_KEEP`
 * `S2T_WHISPER_ARTIFACT_KEEP`
 * `S2T_WHISPER_LOG_MAX_BYTES`
+* `S2T_DATASET_LOG_MAX_BYTES`
+* `S2T_DATASET_LOG_KEEP`
 
 == Resource Limits (systemd cgroups)
 Configured in user units:
 
 * `s2t-whisper.service`
-** `CPUQuota=350%`
+** `CPUQuota=500%`
 ** `MemoryHigh=2500M`
 ** `MemoryMax=3G`
 ** `TasksMax=64`

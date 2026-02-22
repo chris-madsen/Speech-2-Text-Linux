@@ -1,5 +1,7 @@
 ---
+s2t_target_user: ""
 s2t_skip_service_enable: false
+s2t_enable_linger: false
 s2t_enable_cuda: true
 s2t_cuda_arch: ""
 s2t_cuda_force_mmq: ""

@@ -26,3 +26,51 @@
     XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
   failed_when: false
   when: not s2t_skip_service_enable
+
+- name: Restart S2T Monitor (User)
+  systemd:
+    name: s2t-monitor
+    scope: user
+    state: restarted
+    daemon_reload: yes
+  become_user: "{{ s2t_target_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
+  failed_when: false
+  when: not s2t_skip_service_enable
+
+- name: Restart S2T Dataset ETL (User)
+  systemd:
+    name: s2t-dataset-etl
+    scope: user
+    state: restarted
+    daemon_reload: yes
+  become_user: "{{ s2t_target_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
+  failed_when: false
+  when: not s2t_skip_service_enable
+
+- name: Restart S2T Codex Bridge (User)
+  systemd:
+    name: s2t-codex-bridge
+    scope: user
+    state: restarted
+    daemon_reload: yes
+  become_user: "{{ s2t_target_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
+  failed_when: false
+  when: not s2t_skip_service_enable
+
+- name: Restart S2T RabbitMQ Drain (User)
+  systemd:
+    name: s2t-rabbitmq-drain
+    scope: user
+    state: restarted
+    daemon_reload: yes
+  become_user: "{{ s2t_target_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
+  failed_when: false
+  when: not s2t_skip_service_enable

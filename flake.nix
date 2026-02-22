@@ -21,6 +21,8 @@
         packages = [
           python
           pkgs.ffmpeg
+          pkgs.podman
+          pkgs.shadow
           pkgs.cudatoolkit
           pkgs.google-cloud-sdk
           pkgs.git

@@ -7,10 +7,17 @@
     s2t_target_user: >-
       {{
         (
-          ansible_user_id == 'root'
-          and (ansible_env.SUDO_USER | default('') | trim | length > 0)
-          and (ansible_env.SUDO_USER != 'root')
-        ) | ternary(ansible_env.SUDO_USER, ansible_user_id)
+          (s2t_target_user | default('') | trim | length > 0)
+        ) | ternary(
+          (s2t_target_user | trim),
+          (
+            (
+              ansible_user_id == 'root'
+              and (ansible_env.SUDO_USER | default('') | trim | length > 0)
+              and (ansible_env.SUDO_USER != 'root')
+            ) | ternary(ansible_env.SUDO_USER, ansible_user_id)
+          )
+        )
       }}
   changed_when: false
 
@@ -110,7 +117,17 @@
     - controller.sh
     - monitor.py
     - whisper_server.sh
-  notify: Restart S2T Whisper (User)
+    - build_dataset.py
+    - dataset_etl_daemon.py
+    - codex_correction_bridge.py
+    - rabbitmq_publish.py
+    - rabbitmq_drain_daemon.py
+  notify:
+    - Restart S2T Whisper (User)
+    - Restart S2T Monitor (User)
+    - Restart S2T Dataset ETL (User)
+    - Restart S2T Codex Bridge (User)
+    - Restart S2T RabbitMQ Drain (User)
 
 - name: Install default S2T env file (does not overwrite)
   copy:
@@ -119,12 +136,12 @@
     mode: "0644"
     force: false
 
-- name: Make /etc/s2t/s2t.env editable without sudo (group writable)
+- name: Ensure /etc/s2t/s2t.env permissions (root-owned)
   file:
     path: "/etc/s2t/s2t.env"
     owner: "root"
-    group: "{{ s2t_target_user }}"
-    mode: "0664"
+    group: "root"
+    mode: "0644"
   become: true
 
 - name: Compute default model settings (for explicit config)
@@ -146,18 +163,6 @@
   changed_when: false
   failed_when: false
 
-- name: Check if S2T model path is explicitly set
-  command: grep -qE '^S2T_MODEL_PATH=' /etc/s2t/s2t.env
-  register: s2t_has_model_path
-  changed_when: false
-  failed_when: false
-
-- name: Check if S2T model url is explicitly set
-  command: grep -qE '^S2T_MODEL_URL=' /etc/s2t/s2t.env
-  register: s2t_has_model_url
-  changed_when: false
-  failed_when: false
-
 - name: Set default S2T_MODEL_PRESET in /etc/s2t/s2t.env (if missing)
   lineinfile:
     path: "/etc/s2t/s2t.env"
@@ -167,26 +172,6 @@
   become: true
   notify: Restart S2T Whisper (User)
   when: s2t_has_model_preset.rc != 0
-
-- name: Set default S2T_MODEL_PATH in /etc/s2t/s2t.env (if missing)
-  lineinfile:
-    path: "/etc/s2t/s2t.env"
-    regexp: '^S2T_MODEL_PATH='
-    line: "S2T_MODEL_PATH={{ s2t_default_model_path_effective }}"
-    insertafter: EOF
-  become: true
-  notify: Restart S2T Whisper (User)
-  when: s2t_has_model_path.rc != 0
-
-- name: Set default S2T_MODEL_URL in /etc/s2t/s2t.env (if missing)
-  lineinfile:
-    path: "/etc/s2t/s2t.env"
-    regexp: '^S2T_MODEL_URL='
-    line: "S2T_MODEL_URL={{ s2t_default_model_url_effective }}"
-    insertafter: EOF
-  become: true
-  notify: Restart S2T Whisper (User)
-  when: s2t_has_model_url.rc != 0
 
 - name: Set S2T_MODEL_PRESET in /etc/s2t/s2t.env (optional override)
   lineinfile:
@@ -314,6 +299,39 @@
     msg: "Nix build failed."
   when: not build_check.stat.exists
 
+- name: Ensure /usr/local/bin exists
+  file:
+    path: /usr/local/bin
+    state: directory
+    mode: "0755"
+  become: true
+
+- name: Link podman binary from S2T Nix result
+  file:
+    src: /etc/s2t/result/bin/podman
+    dest: /usr/local/bin/podman
+    state: link
+    force: true
+  become: true
+  when: ansible_system == "Linux"
+
+- name: Ensure systemd user generator directory exists
+  file:
+    path: /usr/lib/systemd/user-generators
+    state: directory
+    mode: "0755"
+  become: true
+  when: ansible_system == "Linux"
+
+- name: Link Podman Quadlet user generator from S2T Nix result
+  file:
+    src: /etc/s2t/result/lib/systemd/user-generators/podman-user-generator
+    dest: /usr/lib/systemd/user-generators/podman-user-generator
+    state: link
+    force: true
+  become: true
+  when: ansible_system == "Linux"
+
 # --- GPU DRIVER LIBS (non-NixOS) ---
 
 - name: Detect NVIDIA driver library directory
@@ -423,6 +441,66 @@
     daemon_reload: yes
   when: not s2t_skip_service_enable
 
+# --- ROOTLESS PODMAN PREREQUISITES ---
+
+- name: Install uidmap helpers for rootless podman (Debian family)
+  package:
+    name: uidmap
+    state: present
+  become: true
+  failed_when: false
+  when: ansible_os_family == "Debian"
+
+- name: Install uidmap helpers for rootless podman (RedHat family)
+  package:
+    name: shadow-utils
+    state: present
+  become: true
+  failed_when: false
+  when: ansible_os_family == "RedHat"
+
+- name: Install uidmap helpers for rootless podman (Archlinux)
+  package:
+    name: shadow
+    state: present
+  become: true
+  failed_when: false
+  when: ansible_os_family == "Archlinux"
+
+- name: Check rootless podman uidmap helper readiness
+  shell: |
+    set -euo pipefail
+    nu="$(command -v newuidmap || true)"
+    ng="$(command -v newgidmap || true)"
+    if [ -z "$nu" ] || [ -z "$ng" ]; then
+      echo "missing"
+      exit 0
+    fi
+    if [ -u "$nu" ] && [ -u "$ng" ]; then
+      echo "ready:$nu:$ng"
+    else
+      echo "not_setuid:$nu:$ng"
+    fi
+  args:
+    executable: /bin/bash
+  register: s2t_uidmap_status
+  changed_when: false
+  failed_when: false
+  become: true
+  when: ansible_system == "Linux"
+
+- name: Warn when uidmap helpers are unavailable for rootless podman
+  debug:
+    msg: >-
+      Rootless podman prerequisites are not fully ready
+      (newuidmap/newgidmap missing or not setuid-root).
+      s2t-rabbitmq.service will remain inactive until these helpers are fixed.
+      Detected status: {{ s2t_uidmap_status.stdout | default('unknown') }}
+  when:
+    - ansible_system == "Linux"
+    - s2t_uidmap_status is defined
+    - (s2t_uidmap_status.stdout | default('')) not regex('^ready:')
+
 # --- USER SETUP ---
 
 - name: Add user to input group (for keyd/ydotool access)
@@ -435,20 +513,31 @@
 
 - name: Enable lingering for target user (autostart user services after boot)
   command: "loginctl enable-linger {{ s2t_target_user }}"
-  register: s2t_enable_linger
+  register: s2t_enable_linger_result
   changed_when: false
   failed_when: false
-  when: not s2t_skip_service_enable
+  when:
+    - not s2t_skip_service_enable
+    - s2t_enable_linger | default(false) | bool
 
 - name: Warn when linger enabling failed
   debug:
     msg: >-
-      Could not enable linger for {{ s2t_target_user }} (rc={{ s2t_enable_linger.rc }}).
+      Could not enable linger for {{ s2t_target_user }} (rc={{ s2t_enable_linger_result.rc }}).
       User services will autostart only after user login.
   when:
     - not s2t_skip_service_enable
-    - s2t_enable_linger is defined
-    - s2t_enable_linger.rc != 0
+    - s2t_enable_linger_result is defined
+    - s2t_enable_linger_result.rc != 0
+
+- name: Disable lingering for target user (stop services on logout)
+  command: "loginctl disable-linger {{ s2t_target_user }}"
+  register: s2t_disable_linger_result
+  changed_when: false
+  failed_when: false
+  when:
+    - not s2t_skip_service_enable
+    - not (s2t_enable_linger | default(false) | bool)
 
 - name: Install s2t-monitor service unit directory
   file:
@@ -466,14 +555,38 @@
     group: "{{ s2t_target_user }}"
     mode: "0700"
 
+- name: Ensure user Quadlet directory exists
+  file:
+    path: "{{ s2t_target_home }}/.config/containers/systemd"
+    state: directory
+    owner: "{{ s2t_target_user }}"
+    group: "{{ s2t_target_user }}"
+    mode: "0755"
+
+- name: Ensure user RabbitMQ data directories exist
+  file:
+    path: "{{ s2t_target_home }}/.local/share/s2t/rabbitmq/{{ item }}"
+    state: directory
+    owner: "{{ s2t_target_user }}"
+    group: "{{ s2t_target_user }}"
+    mode: "0755"
+  loop:
+    - data
+    - log
+
 - name: Install per-user override env file
-  copy:
-    src: "s2t.user.env"
+  template:
+    src: "s2t.user.env.default.j2"
     dest: "{{ s2t_target_home }}/.config/s2t/s2t.env"
     owner: "{{ s2t_target_user }}"
     group: "{{ s2t_target_user }}"
     mode: "0644"
     force: "{{ s2t_user_env_force }}"
+  notify:
+    - Restart S2T Whisper (User)
+    - Restart S2T Monitor (User)
+    - Restart S2T Dataset ETL (User)
+    - Restart S2T RabbitMQ Drain (User)
 
 - name: Install per-user secrets env file (does not overwrite)
   copy:
@@ -502,6 +615,60 @@
     mode: '0644'
   notify: Reload Systemd
 
+- name: Copy dataset etl unit
+  copy:
+    src: "s2t-dataset-etl.service"
+    dest: "{{ s2t_target_home }}/.config/systemd/user/s2t-dataset-etl.service"
+    owner: "{{ s2t_target_user }}"
+    group: "{{ s2t_target_user }}"
+    mode: '0644'
+  notify: Reload Systemd
+
+- name: Copy codex bridge unit
+  copy:
+    src: "s2t-codex-bridge.service"
+    dest: "{{ s2t_target_home }}/.config/systemd/user/s2t-codex-bridge.service"
+    owner: "{{ s2t_target_user }}"
+    group: "{{ s2t_target_user }}"
+    mode: '0644'
+  notify: Reload Systemd
+
+- name: Copy rabbitmq unit
+  copy:
+    src: "s2t-rabbitmq.service"
+    dest: "{{ s2t_target_home }}/.config/systemd/user/s2t-rabbitmq.service"
+    owner: "{{ s2t_target_user }}"
+    group: "{{ s2t_target_user }}"
+    mode: '0644'
+  notify: Reload Systemd
+
+- name: Copy rabbitmq drain unit
+  copy:
+    src: "s2t-rabbitmq-drain.service"
+    dest: "{{ s2t_target_home }}/.config/systemd/user/s2t-rabbitmq-drain.service"
+    owner: "{{ s2t_target_user }}"
+    group: "{{ s2t_target_user }}"
+    mode: '0644'
+  notify: Reload Systemd
+
+- name: Copy s2t stack target unit
+  copy:
+    src: "s2t.target"
+    dest: "{{ s2t_target_home }}/.config/systemd/user/s2t.target"
+    owner: "{{ s2t_target_user }}"
+    group: "{{ s2t_target_user }}"
+    mode: '0644'
+  notify: Reload Systemd
+
+- name: Copy rabbitmq Quadlet container definition
+  copy:
+    src: "s2t-rabbitmq.container"
+    dest: "{{ s2t_target_home }}/.config/containers/systemd/s2t-rabbitmq.container"
+    owner: "{{ s2t_target_user }}"
+    group: "{{ s2t_target_user }}"
+    mode: "0644"
+  notify: Reload Systemd
+
 - name: Check if systemd user bus is available
   stat:
     path: "/run/user/{{ s2t_target_uid }}/bus"
@@ -511,7 +678,7 @@
 
 - name: Explain how to enable s2t-monitor when no user session is available
   debug:
-    msg: "Skipping enabling s2t services (systemd --user bus not available). Log in as '{{ s2t_target_user }}' and run: systemctl --user enable --now s2t-whisper s2t-monitor"
+    msg: "Skipping enabling s2t services (systemd --user bus not available). Log in as '{{ s2t_target_user }}' and run: systemctl --user enable --now s2t-rabbitmq s2t-rabbitmq-drain s2t-whisper s2t-monitor s2t-dataset-etl s2t-codex-bridge s2t.target"
   when:
     - not s2t_skip_service_enable
     - not s2t_user_bus.stat.exists
@@ -530,9 +697,79 @@
     - not s2t_skip_service_enable
     - s2t_user_bus.stat.exists
 
+- name: Enable s2t-rabbitmq user service
+  systemd:
+    name: s2t-rabbitmq
+    scope: user
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become_user: "{{ s2t_target_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
+  when:
+    - not s2t_skip_service_enable
+    - s2t_user_bus.stat.exists
+
+- name: Enable s2t-rabbitmq-drain user service
+  systemd:
+    name: s2t-rabbitmq-drain
+    scope: user
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become_user: "{{ s2t_target_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
+  when:
+    - not s2t_skip_service_enable
+    - s2t_user_bus.stat.exists
+
 - name: Enable s2t-monitor user service
   systemd:
     name: s2t-monitor
+    scope: user
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become_user: "{{ s2t_target_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
+  when:
+    - not s2t_skip_service_enable
+    - s2t_user_bus.stat.exists
+
+- name: Enable s2t target unit
+  systemd:
+    name: s2t.target
+    scope: user
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become_user: "{{ s2t_target_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
+  when:
+    - not s2t_skip_service_enable
+    - s2t_user_bus.stat.exists
+
+- name: Enable s2t-dataset-etl user service
+  systemd:
+    name: s2t-dataset-etl
+    scope: user
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become_user: "{{ s2t_target_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
+  when:
+    - not s2t_skip_service_enable
+    - s2t_user_bus.stat.exists
+
+- name: Enable s2t-codex-bridge user service
+  systemd:
+    name: s2t-codex-bridge
     scope: user
     state: started
     enabled: yes

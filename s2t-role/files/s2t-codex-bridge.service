@@ -1,0 +1,24 @@
+[Unit]
+Description=S2T Codex Correction Bridge (User)
+After=graphical-session.target s2t-monitor.service
+PartOf=s2t-monitor.service s2t.target
+
+[Service]
+Type=simple
+ExecStart=/etc/s2t/result/bin/python3 /etc/s2t/scripts/codex_correction_bridge.py
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/s2t/s2t.env
+EnvironmentFile=-%h/.config/s2t/secrets.env
+EnvironmentFile=-%h/.config/s2t/s2t.env
+CPUAccounting=yes
+MemoryAccounting=yes
+TasksAccounting=yes
+CPUQuota=20%
+MemoryMax=256M
+TasksMax=32
+
+[Install]
+WantedBy=default.target
+WantedBy=s2t.target

@@ -1,0 +1,36 @@
+[Unit]
+Description=S2T RabbitMQ (Rootless Podman)
+PartOf=s2t.target
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=%t/containers
+
+[Service]
+Environment=PODMAN_SYSTEMD_UNIT=%n
+Environment=PATH=/etc/s2t/result/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PODMAN_BIN_DEFAULT=/etc/s2t/result/bin/podman
+KillMode=mixed
+Type=notify
+NotifyAccess=all
+SyslogIdentifier=%N
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=180
+Delegate=yes
+CPUAccounting=yes
+MemoryAccounting=yes
+TasksAccounting=yes
+CPUQuota=150%
+MemoryMax=500M
+TasksMax=256
+EnvironmentFile=/etc/s2t/s2t.env
+EnvironmentFile=-%h/.config/s2t/secrets.env
+EnvironmentFile=-%h/.config/s2t/s2t.env
+ExecCondition=/bin/bash -lc 'set -euo pipefail; PODMAN_BIN="${S2T_PODMAN_BIN:-$PODMAN_BIN_DEFAULT}"; if [ ! -x "$PODMAN_BIN" ]; then PODMAN_BIN="$(command -v podman || true)"; fi; [ -x "$PODMAN_BIN" ] || { echo "podman binary not found: $PODMAN_BIN" >&2; exit 1; }; NEWUIDMAP_BIN="/usr/bin/newuidmap"; NEWGIDMAP_BIN="/usr/bin/newgidmap"; if [ ! -x "$NEWUIDMAP_BIN" ] || [ ! -x "$NEWGIDMAP_BIN" ]; then NEWUIDMAP_BIN="$(command -v newuidmap || true)"; NEWGIDMAP_BIN="$(command -v newgidmap || true)"; fi; [ -n "$NEWUIDMAP_BIN" ] && [ -n "$NEWGIDMAP_BIN" ] || { echo "newuidmap/newgidmap missing in PATH for rootless podman" >&2; exit 1; }; [ -u "$NEWUIDMAP_BIN" ] && [ -u "$NEWGIDMAP_BIN" ] || { echo "newuidmap/newgidmap must be setuid root" >&2; exit 1; }'
+ExecStart=/bin/bash -lc 'set -euo pipefail; PODMAN_BIN="${S2T_PODMAN_BIN:-$PODMAN_BIN_DEFAULT}"; if [ ! -x "$PODMAN_BIN" ]; then PODMAN_BIN="$(command -v podman || true)"; fi; [ -x "$PODMAN_BIN" ] || { echo "podman binary not found: $PODMAN_BIN" >&2; exit 127; }; exec "$PODMAN_BIN" run --name s2t-rabbitmq --replace --rm --cgroups=split --pull missing --sdnotify=conmon -d -v %h/.local/share/s2t/rabbitmq/data:/var/lib/rabbitmq -v %h/.local/share/s2t/rabbitmq/log:/var/log/rabbitmq --publish 127.0.0.1:5672:5672 --publish 127.0.0.1:15672:15672 --env RABBITMQ_DEFAULT_PASS="${S2T_RABBITMQ_DEFAULT_PASS:-s2t}" --env RABBITMQ_DEFAULT_USER="${S2T_RABBITMQ_DEFAULT_USER:-s2t}" --memory=500m --pids-limit=256 --log-driver=journald "${S2T_RABBITMQ_IMAGE:-docker.io/library/rabbitmq:3.13-management}"'
+ExecStop=/bin/bash -lc 'set -euo pipefail; PODMAN_BIN="${S2T_PODMAN_BIN:-$PODMAN_BIN_DEFAULT}"; if [ ! -x "$PODMAN_BIN" ]; then PODMAN_BIN="$(command -v podman || true)"; fi; [ -x "$PODMAN_BIN" ] || exit 0; "$PODMAN_BIN" rm -v -f -i s2t-rabbitmq'
+ExecStopPost=-/bin/bash -lc 'set -euo pipefail; PODMAN_BIN="${S2T_PODMAN_BIN:-$PODMAN_BIN_DEFAULT}"; if [ ! -x "$PODMAN_BIN" ]; then PODMAN_BIN="$(command -v podman || true)"; fi; [ -x "$PODMAN_BIN" ] || exit 0; "$PODMAN_BIN" rm -v -f -i s2t-rabbitmq'
+
+[Install]
+WantedBy=default.target
+WantedBy=s2t.target

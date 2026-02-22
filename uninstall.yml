@@ -8,10 +8,17 @@
         s2t_target_user: >-
           {{
             (
-              ansible_user_id == 'root'
-              and (ansible_env.SUDO_USER | default('') | trim | length > 0)
-              and (ansible_env.SUDO_USER != 'root')
-            ) | ternary(ansible_env.SUDO_USER, ansible_user_id)
+              (s2t_target_user | default('') | trim | length > 0)
+            ) | ternary(
+              (s2t_target_user | trim),
+              (
+                (
+                  ansible_user_id == 'root'
+                  and (ansible_env.SUDO_USER | default('') | trim | length > 0)
+                  and (ansible_env.SUDO_USER != 'root')
+                ) | ternary(ansible_env.SUDO_USER, ansible_user_id)
+              )
+            )
           }}
       changed_when: false
 
@@ -48,6 +55,61 @@
         XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
       ignore_errors: yes
 
+    - name: Stop and disable s2t-dataset-etl user service
+      systemd:
+        name: s2t-dataset-etl
+        scope: user
+        state: stopped
+        enabled: no
+      become_user: "{{ s2t_target_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
+      ignore_errors: yes
+
+    - name: Stop and disable s2t-codex-bridge user service
+      systemd:
+        name: s2t-codex-bridge
+        scope: user
+        state: stopped
+        enabled: no
+      become_user: "{{ s2t_target_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
+      ignore_errors: yes
+
+    - name: Stop and disable s2t-rabbitmq user service
+      systemd:
+        name: s2t-rabbitmq
+        scope: user
+        state: stopped
+        enabled: no
+      become_user: "{{ s2t_target_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
+      ignore_errors: yes
+
+    - name: Stop and disable s2t-rabbitmq-drain user service
+      systemd:
+        name: s2t-rabbitmq-drain
+        scope: user
+        state: stopped
+        enabled: no
+      become_user: "{{ s2t_target_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
+      ignore_errors: yes
+
+    - name: Stop and disable s2t target user unit
+      systemd:
+        name: s2t.target
+        scope: user
+        state: stopped
+        enabled: no
+      become_user: "{{ s2t_target_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
+      ignore_errors: yes
+
     - name: Remove s2t-monitor unit
       file:
         path: "{{ s2t_target_home }}/.config/systemd/user/s2t-monitor.service"
@@ -56,6 +118,41 @@
     - name: Remove s2t-whisper unit
       file:
         path: "{{ s2t_target_home }}/.config/systemd/user/s2t-whisper.service"
+        state: absent
+
+    - name: Remove s2t-dataset-etl unit
+      file:
+        path: "{{ s2t_target_home }}/.config/systemd/user/s2t-dataset-etl.service"
+        state: absent
+
+    - name: Remove s2t-codex-bridge unit
+      file:
+        path: "{{ s2t_target_home }}/.config/systemd/user/s2t-codex-bridge.service"
+        state: absent
+
+    - name: Remove s2t-rabbitmq unit
+      file:
+        path: "{{ s2t_target_home }}/.config/systemd/user/s2t-rabbitmq.service"
+        state: absent
+
+    - name: Remove s2t-rabbitmq-drain unit
+      file:
+        path: "{{ s2t_target_home }}/.config/systemd/user/s2t-rabbitmq-drain.service"
+        state: absent
+
+    - name: Remove s2t target unit
+      file:
+        path: "{{ s2t_target_home }}/.config/systemd/user/s2t.target"
+        state: absent
+
+    - name: Remove rabbitmq Quadlet definition
+      file:
+        path: "{{ s2t_target_home }}/.config/containers/systemd/s2t-rabbitmq.container"
+        state: absent
+
+    - name: Remove rabbitmq user state directory
+      file:
+        path: "{{ s2t_target_home }}/.local/share/s2t/rabbitmq"
         state: absent
 
     - name: Disable GNOME extension

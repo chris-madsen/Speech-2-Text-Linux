@@ -11,6 +11,33 @@ MODEL_PATH="${S2T_MODEL_PATH:-}"
 MODEL_URL="${S2T_MODEL_URL:-}"
 MODEL_PRESET="${S2T_MODEL_PRESET:-balanced}" # fast|balanced|medium|accurate
 
+resolve_model_path_for_current_user() {
+  local requested="$1"
+  local requested_dir requested_base fallback_path
+
+  [ -n "$requested" ] || return 0
+
+  if [ -f "$requested" ] && [ -r "$requested" ]; then
+    return 0
+  fi
+
+  requested_dir="$(dirname "$requested")"
+  if [ -d "$requested_dir" ] && [ -w "$requested_dir" ]; then
+    return 0
+  fi
+  if mkdir -p "$requested_dir" >/dev/null 2>&1 && [ -w "$requested_dir" ]; then
+    return 0
+  fi
+
+  requested_base="$(basename "$requested")"
+  fallback_path="${MODEL_DIR}/${requested_base}"
+  echo "S2T: model path '$requested' is not writable/readable; falling back to '$fallback_path'" >&2
+  MODEL_PATH="$fallback_path"
+  if [ -z "${MODEL_URL}" ]; then
+    MODEL_URL="$(model_url_for "$requested_base")"
+  fi
+}
+
 model_url_for() {
   case "$1" in
     ggml-large-v3-turbo.bin) printf '%s' "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin" ;;
@@ -44,6 +71,8 @@ if [ -z "${MODEL_PATH}" ]; then
   MODEL_URL="${MODEL_URL:-$(model_url_for "$(basename "$MODEL_PATH")")}"
 fi
 
+resolve_model_path_for_current_user "$MODEL_PATH"
+
 mkdir -p "$MODEL_DIR"
 if [ ! -f "$MODEL_PATH" ]; then
   if [ -z "${MODEL_URL}" ]; then
@@ -57,7 +86,13 @@ echo "S2T: using model $MODEL_PATH" >&2
 
 PORT="${S2T_WHISPER_SERVER_PORT:-9787}"
 LANG="${S2T_LANG:-auto}"
-THREADS="${S2T_THREADS:-$(nproc 2>/dev/null || echo 4)}"
+THREADS_DEFAULT="$(nproc 2>/dev/null || echo 4)"
+if ! [[ "$THREADS_DEFAULT" =~ ^[0-9]+$ ]] || [ "$THREADS_DEFAULT" -lt 1 ]; then
+  THREADS_DEFAULT=4
+elif [ "$THREADS_DEFAULT" -gt 4 ]; then
+  THREADS_DEFAULT=4
+fi
+THREADS="${S2T_THREADS:-$THREADS_DEFAULT}"
 BEAM_SIZE="${S2T_BEAM_SIZE:-1}"
 BEST_OF="${S2T_BEST_OF:-1}"
 NO_SPEECH_THOLD="${S2T_NO_SPEECH_THOLD:-0.6}"

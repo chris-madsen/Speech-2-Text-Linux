@@ -1,12 +1,18 @@
 [Unit]
 Description=S2T Key Monitor (User)
 After=graphical-session.target
+PartOf=s2t.target
 
 [Service]
-ExecStart=/etc/s2t/result/bin/s2t-monitor
-Restart=always
+ExecStart=/etc/s2t/result/bin/python3 /etc/s2t/scripts/monitor.py
+Restart=on-failure
 Environment=YDOTOOL_SOCKET=/run/ydotool.socket
 Environment=PYTHONUNBUFFERED=1
+Environment=S2T_MONITOR_LOCK_PATH=/tmp/s2t-monitor-global.lock
+Environment=S2T_MONITOR_PRIMARY_KEY=F24
+Environment=S2T_MONITOR_FALLBACK_KEYS=RIGHTALT,MENU
+Environment=S2T_MONITOR_IDLE_REOPEN_SEC=90
+Environment=S2T_CONTROLLER=/etc/s2t/scripts/controller.sh
 EnvironmentFile=/etc/s2t/s2t.env
 EnvironmentFile=-%h/.config/s2t/secrets.env
 EnvironmentFile=-%h/.config/s2t/s2t.env
@@ -19,3 +25,4 @@ TasksMax=32
 
 [Install]
 WantedBy=default.target
+WantedBy=s2t.target

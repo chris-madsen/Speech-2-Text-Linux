@@ -22,6 +22,8 @@
           let
             runtimeDeps = with pkgsSet; [
               whisperPkg
+              podman
+              shadow
               pipewire
               wl-clipboard
               xclip
@@ -31,8 +33,9 @@
               keyd
               ydotool
               sox
+              ffmpeg
               xdotool
-              (python3.withPackages (p: [ p.evdev p.google-cloud-speech ]))
+              (python3.withPackages (p: [ p.evdev p.google-cloud-speech p.pika ]))
             ];
 
             controller = pkgsSet.writeScriptBin "s2t-controller" (builtins.readFile ./scripts/controller.sh);
