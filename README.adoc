@@ -9,7 +9,7 @@ The project is intended for daily dictation workflows where latency and reliabil
 This repository provides:
 
 * reproducible install and uninstall via Ansible
-* cloud-first recognition (Google/OpenAI)
+* cloud-first recognition (GCP Whisper L4 / Google / OpenAI)
 * local fallback (whisper-server / whisper-cli) when cloud fails
 * persistent whisper model in memory for faster local fallback
 * systemd user services with cgroup limits and log rotation controls
@@ -19,6 +19,7 @@ Main components:
 
 * `s2t-monitor.service`: listens for key events and starts/stops recording
 * `s2t-whisper.service`: runs `whisper-server` and keeps model loaded
+* `s2t-whisper-cloud-keepalive.service`: pings Cloud Run `/health` every 8 minutes
 * `s2t-rabbitmq.service` (Podman): durable queue broker for dataset jobs
 * `s2t-rabbitmq-drain.service`: consumes RabbitMQ jobs and materializes local `.job` files
 * `s2t-dataset-etl.service`: watches correction queue and rebuilds JSONL dataset
@@ -72,6 +73,10 @@ make test-playbooks
 ----
 make test
 ----
+* Deploy Whisper Large-v3-Turbo to Cloud Run L4:
+----
+make deploy-gcp-l4 PROJECT_ID=<gcp-project-id> REGION=europe-north1
+----
 * Build training dataset (audio+text -> JSONL):
 ----
 make dataset-build DATASET_INPUT=data/raw DATASET_OUTPUT=data/dataset DATASET_TEST_RATIO=0.1 DATASET_JOBS=4 DATASET_SEED=42
@@ -82,6 +87,7 @@ User services:
 
 * `s2t-monitor.service`
 * `s2t-whisper.service`
+* `s2t-whisper-cloud-keepalive.service`
 * `s2t-rabbitmq.service`
 * `s2t-rabbitmq-drain.service`
 * `s2t-dataset-etl.service`
@@ -98,6 +104,7 @@ systemctl --user list-units --type=service | rg s2t
 ----
 systemctl --user status s2t-monitor.service
 systemctl --user status s2t-whisper.service
+systemctl --user status s2t-whisper-cloud-keepalive.service
 systemctl --user status s2t-rabbitmq.service
 systemctl --user status s2t-rabbitmq-drain.service
 systemctl --user status s2t-dataset-etl.service
@@ -107,6 +114,7 @@ systemctl --user status s2t.target
 * Restart:
 ----
 systemctl --user restart s2t-monitor.service s2t-whisper.service
+systemctl --user restart s2t-whisper-cloud-keepalive.service
 systemctl --user restart s2t-rabbitmq.service s2t-rabbitmq-drain.service
 systemctl --user restart s2t-dataset-etl.service s2t-codex-bridge.service s2t.target
 ----
@@ -114,7 +122,7 @@ systemctl --user restart s2t-dataset-etl.service s2t-codex-bridge.service s2t.ta
 == Autostart
 Autostart is enabled by:
 
-* `systemctl --user enable s2t-rabbitmq s2t-rabbitmq-drain s2t-whisper s2t-monitor s2t-dataset-etl s2t-codex-bridge s2t.target`
+* `systemctl --user enable s2t-rabbitmq s2t-rabbitmq-drain s2t-whisper s2t-whisper-cloud-keepalive s2t-monitor s2t-dataset-etl s2t-codex-bridge s2t.target`
 * user linger: `loginctl enable-linger <user>`
 
 == Configuration
@@ -129,8 +137,19 @@ Per-user overrides:
 
 Important variables:
 
-* `S2T_ASR_PROVIDER=google|openai|google-v2|local`
+* `S2T_ASR_PROVIDER=gcp-l4|google|openai|google-v2|local`
+* `S2T_GCP_WHISPER_URL=https://...run.app`
+* `S2T_GCP_WHISPER_INFER_PATH=/inference`
+* `S2T_GCP_WHISPER_TIMEOUT_SEC=5`
+* `S2T_GCP_WHISPER_DYNAMIC_TIMEOUT=1`
+* `S2T_GCP_WHISPER_TIMEOUT_PER_AUDIO_SEC=0.5`
+* `S2T_GCP_WHISPER_TIMEOUT_MAX_SEC=90`
+* `S2T_GCP_KEEPALIVE_INTERVAL_SEC=480`
 * `S2T_USE_SERVER=1`
+* `S2T_SERVER_TIMEOUT_SEC=4`
+* `S2T_SERVER_DYNAMIC_TIMEOUT=1`
+* `S2T_SERVER_TIMEOUT_PER_AUDIO_SEC=0.5`
+* `S2T_SERVER_TIMEOUT_MAX_SEC=90`
 * `S2T_NETWORK_ONLY=0|1`
 * `S2T_MAX_RESPONSE_SECONDS=5`
 * `S2T_GOOGLE_TIMEOUT_SEC=4`
@@ -201,7 +220,7 @@ Dataset-related variables:
 * `S2T_CODEX_BRIDGE_MIN_TOKEN_OVERLAP`
 
 == ASR Behavior
-* Cloud-first: set `S2T_ASR_PROVIDER` to `google`/`openai`/`google-v2`
+* Cloud-first: set `S2T_ASR_PROVIDER` to `gcp-l4`/`google`/`openai`/`google-v2`
 * Local fallback enabled: `S2T_NETWORK_ONLY=0`
 * Strict cloud-only mode: `S2T_NETWORK_ONLY=1`
 
@@ -229,6 +248,10 @@ journalctl --user -u s2t-monitor.service -f
 * Whisper journal:
 ----
 journalctl --user -u s2t-whisper.service -f
+----
+* Whisper Cloud keepalive journal:
+----
+journalctl --user -u s2t-whisper-cloud-keepalive.service -f
 ----
 * Dataset ETL journal:
 ----

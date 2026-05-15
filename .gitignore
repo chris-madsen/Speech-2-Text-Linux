@@ -31,3 +31,11 @@ tmp/
 .vscode/
 *~
 .DS_Store
+
+# Data directories
+hf/
+hf_pending/
+quarantine/
+raw/
+queue/
+pending/

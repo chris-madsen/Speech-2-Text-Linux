@@ -5,12 +5,14 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 controller="$repo_root/s2t-role/files/scripts/controller.sh"
 monitor_script="$repo_root/s2t-role/files/scripts/monitor.py"
 whisper_server_script="$repo_root/s2t-role/files/scripts/whisper_server.sh"
+whisper_cloud_keepalive_script="$repo_root/s2t-role/files/scripts/whisper_cloud_keepalive.sh"
 dataset_etl_script="$repo_root/s2t-role/files/scripts/dataset_etl_daemon.py"
 codex_bridge_script="$repo_root/s2t-role/files/scripts/codex_correction_bridge.py"
 rabbitmq_publish_script="$repo_root/s2t-role/files/scripts/rabbitmq_publish.py"
 rabbitmq_drain_script="$repo_root/s2t-role/files/scripts/rabbitmq_drain_daemon.py"
 monitor_unit="$repo_root/s2t-role/files/s2t-monitor.service"
 whisper_unit="$repo_root/s2t-role/files/s2t-whisper.service"
+whisper_cloud_keepalive_unit="$repo_root/s2t-role/files/s2t-whisper-cloud-keepalive.service"
 dataset_etl_unit="$repo_root/s2t-role/files/s2t-dataset-etl.service"
 codex_bridge_unit="$repo_root/s2t-role/files/s2t-codex-bridge.service"
 rabbitmq_unit="$repo_root/s2t-role/files/s2t-rabbitmq.service"
@@ -29,6 +31,14 @@ flake_file="$repo_root/s2t-role/files/flake.nix"
 # Runtime tests provide explicit env and should not import host-level user/system
 # overrides unless the test explicitly verifies env autoload behavior.
 export S2T_AUTOLOAD_ENV_FILES=0
+if [ -z "${S2T_TEST_RUNTIME_BASE:-}" ]; then
+  if [ -d /dev/shm ] && probe_dir="$(mktemp -d /dev/shm/s2t-test-probe-XXXXXX 2>/dev/null)"; then
+    rm -rf "$probe_dir"
+    S2T_TEST_RUNTIME_BASE="/dev/shm"
+  else
+    S2T_TEST_RUNTIME_BASE="/tmp"
+  fi
+fi
 
 fail() {
   echo "FAIL: $*" >&2
@@ -68,6 +78,7 @@ set -euo pipefail
 out="${@: -1}"
 mkdir -p "$(dirname "$out")"
 : > "$out"
+printf 'RIFF0000WAVE' >>"$out"
 printf '1234123412341234123412341234123412341234123412341234123412341234' >>"$out"
 trap 'exit 0' TERM INT
 while true; do
@@ -88,6 +99,7 @@ printf '%s\n' "$@" >"$FAKE_PW_RECORD_ARGS_FILE"
 out="${@: -1}"
 mkdir -p "$(dirname "$out")"
 : > "$out"
+printf 'RIFF0000WAVE' >>"$out"
 printf '1234123412341234123412341234123412341234123412341234123412341234' >>"$out"
 trap 'exit 0' TERM INT
 while true; do
@@ -105,7 +117,8 @@ write_fake_pw_record_delayed_payload_on_term() {
 set -euo pipefail
 out="${@: -1}"
 mkdir -p "$(dirname "$out")"
-dd if=/dev/zero of="$out" bs=44 count=1 status=none
+: >"$out"
+printf 'RIFF0000WAVE' >>"$out"
 exec 3>>"$out"
 trap '(sleep 0.18; dd if=/dev/zero bs=6400 count=1 status=none >&3 || true; exec 3>&-) & exit 0' TERM INT
 while true; do
@@ -223,6 +236,82 @@ fi
 exit 0
 EOF
   chmod +x "$fakebin/xdotool"
+}
+
+write_fake_xdotool_capture_args() {
+  local fakebin="$1"
+  cat >"$fakebin/xdotool" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ -n "${FAKE_XDOTOOL_ARGS_MARKER:-}" ]; then
+  printf '%s\n' "$*" >>"$FAKE_XDOTOOL_ARGS_MARKER"
+fi
+exit 0
+EOF
+  chmod +x "$fakebin/xdotool"
+}
+
+write_fake_xdotool_hang_on_type() {
+  local fakebin="$1"
+  cat >"$fakebin/xdotool" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  getwindowfocus)
+    if [ "${2:-}" = "getwindowclassname" ]; then
+      printf 'Code\n'
+      exit 0
+    fi
+    if [ "${2:-}" = "getwindowname" ]; then
+      printf 'Welcome - s2t - Visual Studio Code\n'
+      exit 0
+    fi
+    printf '6291460\n'
+    exit 0
+    ;;
+  key)
+    sleep 30
+    ;;
+esac
+exit 0
+EOF
+  chmod +x "$fakebin/xdotool"
+}
+
+write_fake_xclip_capture_clipboard() {
+  local fakebin="$1"
+  cat >"$fakebin/xclip" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+selection="primary"
+want_output=0
+for arg in "$@"; do
+  case "$arg" in
+    clipboard|primary|secondary|buffer-cut)
+      selection="$arg"
+      ;;
+    -o)
+      want_output=1
+      ;;
+  esac
+done
+
+if [ "$want_output" -eq 1 ]; then
+  if [ "$selection" = "clipboard" ]; then
+    printf '%s' "${FAKE_XCLIP_CLIPBOARD_READ_TEXT:-}"
+  elif [ "$selection" = "secondary" ]; then
+    printf '%s' "${FAKE_XCLIP_SECONDARY_READ_TEXT:-}"
+  fi
+  exit 0
+fi
+
+payload="$(cat || true)"
+if [ -n "${FAKE_XCLIP_WRITE_MARKER:-}" ]; then
+  printf 'selection=%s payload=%s\n' "$selection" "$payload" >>"$FAKE_XCLIP_WRITE_MARKER"
+fi
+exit 0
+EOF
+  chmod +x "$fakebin/xclip"
 }
 
 write_fake_sox() {
@@ -601,6 +690,12 @@ test_capture_fail_fallback_controls_present() {
 test_network_only_controls_present() {
   assert_contains "$controller" 'S2T_NETWORK_ONLY="\$\{S2T_NETWORK_ONLY:-0\}"'
   assert_contains "$controller" 'S2T_MAX_RESPONSE_SECONDS="\$\{S2T_MAX_RESPONSE_SECONDS:-0\}"'
+  assert_contains "$controller" 'S2T_GCP_WHISPER_URL="\$\{S2T_GCP_WHISPER_URL:-\}"'
+  assert_contains "$controller" 'S2T_GCP_WHISPER_INFER_PATH="\$\{S2T_GCP_WHISPER_INFER_PATH:-/inference\}"'
+  assert_contains "$controller" 'S2T_GCP_WHISPER_CONNECT_TIMEOUT_SEC="\$\{S2T_GCP_WHISPER_CONNECT_TIMEOUT_SEC:-3\}"'
+  assert_contains "$controller" 'S2T_GCP_WHISPER_TIMEOUT_SEC="\$\{S2T_GCP_WHISPER_TIMEOUT_SEC:-0\}"'
+  assert_contains "$controller" 'transcribe_with_gcp_l4\(\)'
+  assert_contains "$controller" 'asr: gcp-l4 empty/fail; network-only enabled, skipping local fallback'
   assert_contains "$controller" 'S2T_LOG_VERBOSE="\$\{S2T_LOG_VERBOSE:-0\}"'
   assert_contains "$controller" 'S2T_PRESERVE_CLIPBOARD_STRICT="\$\{S2T_PRESERVE_CLIPBOARD_STRICT:-0\}"'
   assert_contains "$controller" 'S2T_AVOID_LOOPBACK_SOURCE="\$\{S2T_AVOID_LOOPBACK_SOURCE:-1\}"'
@@ -693,13 +788,28 @@ test_dataset_etl_service_setup_present() {
   assert_contains "$dataset_etl_unit" '^TasksMax=32$'
   assert_contains "$tasks_main" 'Copy dataset etl unit'
   assert_contains "$tasks_main" 'Enable s2t-dataset-etl user service'
-  assert_contains "$tasks_main" 's2t-whisper s2t-monitor s2t-dataset-etl'
+  assert_contains "$tasks_main" 's2t-whisper s2t-whisper-cloud-keepalive s2t-monitor s2t-dataset-etl'
   assert_contains "$tasks_main" '- build_dataset.py'
   assert_contains "$tasks_main" '- dataset_etl_daemon.py'
   assert_contains "$uninstall_playbook" 'Stop and disable s2t-dataset-etl user service'
   assert_contains "$uninstall_playbook" 'Remove s2t-dataset-etl unit'
   assert_contains "$dataset_etl_script" 'Asynchronous dataset ETL daemon for S2T correction jobs.'
   assert_contains "$flake_file" 'ffmpeg'
+}
+
+test_whisper_cloud_keepalive_setup_present() {
+  assert_contains "$whisper_cloud_keepalive_unit" '^ExecStart=/etc/s2t/scripts/whisper_cloud_keepalive.sh$'
+  assert_contains "$whisper_cloud_keepalive_unit" '^PartOf=s2t.target$'
+  assert_contains "$whisper_cloud_keepalive_unit" '^ExecCondition=/bin/bash -lc '
+  assert_contains "$whisper_cloud_keepalive_script" 'S2T_GCP_WHISPER_URL'
+  assert_contains "$whisper_cloud_keepalive_script" 'S2T_GCP_KEEPALIVE_INTERVAL_SEC'
+  assert_contains "$tasks_main" 'Copy whisper cloud keepalive unit'
+  assert_contains "$tasks_main" 'Enable s2t-whisper-cloud-keepalive user service'
+  assert_contains "$tasks_main" '- whisper_cloud_keepalive.sh'
+  assert_contains "$handlers_main" 'Restart S2T Whisper Cloud Keepalive \(User\)'
+  assert_contains "$uninstall_playbook" 'Stop and disable s2t-whisper-cloud-keepalive user service'
+  assert_contains "$uninstall_playbook" 'Remove s2t-whisper-cloud-keepalive unit'
+  assert_contains "$s2t_target_unit" 's2t-whisper-cloud-keepalive.service'
 }
 
 test_codex_bridge_service_setup_present() {
@@ -860,22 +970,25 @@ test_model_path_fallback_guards_present() {
 test_user_env_long_dictation_profile() {
   assert_contains "$user_env_file" '^S2T_MODEL_PATH=$'
   assert_contains "$user_env_file" '^S2T_MODEL_URL=$'
-  assert_contains "$user_env_file" '^S2T_GOOGLE_MODEL=latest_long$'
-  assert_contains "$user_env_file" '^S2T_GOOGLE_SHORT_MODEL=latest_long$'
-  assert_contains "$user_env_file" '^S2T_GOOGLE_CONNECT_TIMEOUT_SEC=3$'
-  assert_contains "$user_env_file" '^S2T_GOOGLE_TIMEOUT_SEC=5$'
-  assert_contains "$user_env_file" '^S2T_GOOGLE_SHORT_AUDIO_SEC=4$'
-  assert_contains "$user_env_file" '^S2T_GOOGLE_RETRY_ON_EMPTY=1$'
-  assert_contains "$user_env_file" '^S2T_GOOGLE_RETRY_ON_SHORT=1$'
-  assert_contains "$user_env_file" '^S2T_GOOGLE_SHORT_RESULT_AUDIO_SEC=4$'
-  assert_contains "$user_env_file" '^S2T_GOOGLE_MIN_CHARS_PER_AUDIO_SEC=3.5$'
-  assert_contains "$user_env_file" '^S2T_GOOGLE_V2_TIMEOUT_SEC=5$'
-  assert_contains "$user_env_file" '^S2T_GOOGLE_V2_ON_EMPTY=1$'
-  assert_contains "$user_env_file" '^S2T_SERVER_TIMEOUT_SEC=4$'
-  assert_contains "$user_env_file" '^S2T_SKIP_LOCAL_FALLBACK_ON_TIMEOUT=1$'
-  assert_contains "$user_env_file" '^S2T_MAX_RESPONSE_SECONDS=5$'
-  assert_contains "$user_env_file" '^S2T_TRANSCRIBE_STALE_SEC=8$'
+  assert_contains "$user_env_file" '^S2T_PRESERVE_CLIPBOARD=1$'
+  assert_contains "$user_env_file" '^S2T_CLIPBOARD_RESTORE_DELAY_MS=350$'
+  assert_contains "$user_env_file" '^S2T_CLIPBOARD_RESTORE_PER_CHAR_MS=2$'
+  assert_contains "$user_env_file" '^S2T_CLIPBOARD_RESTORE_EXTRA_MAX_MS=2500$'
+  assert_contains "$user_env_file" '^S2T_REFOCUS_TARGET_WINDOW=1$'
+  assert_contains "$user_env_file" '^S2T_SECONDARY_BUFFER_ENABLE=1$'
+  assert_contains "$user_env_file" '^S2T_X11_SECONDARY_AUTO_INSERT=1$'
+  assert_contains "$user_env_file" '^S2T_X11_SECONDARY_MANUAL_PASTE=1$'
+  assert_contains "$user_env_file" '^S2T_ASR_PROVIDER=local$'
+  assert_contains "$user_env_file" '^S2T_LOCAL_DISABLE_CLI_FALLBACK=1$'
+  assert_contains "$user_env_file" '^S2T_SERVER_TIMEOUT_SEC=0$'
+  assert_contains "$user_env_file" '^S2T_SERVER_DYNAMIC_TIMEOUT=1$'
+  assert_contains "$user_env_file" '^S2T_SERVER_TIMEOUT_PER_AUDIO_SEC=0.5$'
+  assert_contains "$user_env_file" '^S2T_SERVER_TIMEOUT_MAX_SEC=90$'
+  assert_contains "$user_env_file" '^S2T_SKIP_LOCAL_FALLBACK_ON_TIMEOUT=0$'
+  assert_contains "$user_env_file" '^S2T_MAX_RESPONSE_SECONDS=0$'
+  assert_contains "$user_env_file" '^S2T_TRANSCRIBE_STALE_SEC=45$'
   assert_contains "$user_env_file" '^S2T_TRANSCRIBE_ACQUIRE_RETRY_MS=1500$'
+  assert_contains "$user_env_file" '^S2T_DROP_WHEN_BUSY=0$'
   assert_contains "$user_env_file" '^S2T_AUDIO_TARGET_EXCLUDE_RE="snd_aloop\|loopback\|monitor"$'
   assert_contains "$user_env_file" '^S2T_ENABLE_ALSA_CAPTURE_FALLBACK=1$'
   assert_contains "$user_env_file" '^S2T_DATASET_ROOT=\{\{ s2t_target_home \}\}/.local/share/s2t/dataset$'
@@ -914,7 +1027,7 @@ test_stop_race_lock() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-race-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-race-$$-$RANDOM"
   mkdir -p "$runbase"
 
   write_fake_pw_record "$fakebin"
@@ -954,7 +1067,7 @@ test_stop_lock_released_before_clipboard_owner() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-lock-release-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-lock-release-$$-$RANDOM"
   mkdir -p "$runbase"
 
   write_fake_pw_record "$fakebin"
@@ -993,7 +1106,7 @@ test_network_only_skips_local_fallback_runtime() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-network-only-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-network-only-$$-$RANDOM"
   mkdir -p "$runbase"
 
   write_fake_pw_record "$fakebin"
@@ -1030,7 +1143,7 @@ test_zero_duration_skips_asr_runtime() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-zero-audio-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-zero-audio-$$-$RANDOM"
   mkdir -p "$runbase"
   curl_args="$tmp/curl_args.txt"
 
@@ -1067,7 +1180,7 @@ test_wait_for_delayed_wav_payload() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-delayed-wav-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-delayed-wav-$$-$RANDOM"
   mkdir -p "$runbase"
   curl_args="$tmp/curl_args.txt"
 
@@ -1104,7 +1217,7 @@ test_drop_when_busy_prevents_transcribe_queue() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-busy-drop-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-busy-drop-$$-$RANDOM"
   mkdir -p "$runbase"
 
   write_fake_pw_record "$fakebin"
@@ -1150,7 +1263,7 @@ test_stale_transcribe_lock_recovery_runtime() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-stale-lock-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-stale-lock-$$-$RANDOM"
   mkdir -p "$runbase"
 
   write_fake_pw_record "$fakebin"
@@ -1206,7 +1319,7 @@ test_preserve_clipboard_no_overwrite_on_snapshot_failure() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-clipboard-preserve-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-clipboard-preserve-$$-$RANDOM"
   mkdir -p "$runbase"
   xclip_write_marker="$tmp/xclip_write.log"
   xdotool_type_marker="$tmp/xdotool_type.log"
@@ -1226,6 +1339,7 @@ test_preserve_clipboard_no_overwrite_on_snapshot_failure() {
     export S2T_INSERT_METHOD=paste
     export S2T_PRESERVE_CLIPBOARD=1
     export S2T_PRESERVE_CLIPBOARD_STRICT=1
+    export S2T_X11_SECONDARY_AUTO_INSERT=0
     export S2T_USE_SERVER=1
     export FAKE_CURL_TEXT="clipboard-safe"
     export FAKE_XCLIP_WRITE_MARKER="$xclip_write_marker"
@@ -1237,33 +1351,28 @@ test_preserve_clipboard_no_overwrite_on_snapshot_failure() {
 
   logfile="$runbase/s2t/s2t.log"
   [ -f "$logfile" ] || fail "log file missing in clipboard preserve test"
-  rg -q "preserve_clipboard=1 but cannot snapshot clipboard" "$logfile" || fail "expected clipboard snapshot failure log"
-  rg -q "insert: typed fallback to preserve clipboard" "$logfile" || fail "typed preserve fallback log missing"
-  [ -f "$xdotool_type_marker" ] || fail "typing fallback was not used"
-  [ ! -f "$xclip_write_marker" ] || fail "clipboard was overwritten despite preserve fallback"
-  if rg -q "insert: pasted" "$logfile"; then
-    fail "paste path used unexpectedly during clipboard-preserve fallback"
-  fi
-
+  rg -q "insert: skipped auto insert on X11; transcript kept in secondary buffer" "$logfile" || fail "expected X11 secondary auto-insert skip log"
+  [ ! -f "$xdotool_type_marker" ] || fail "typing helper should stay unused when X11 auto-insert is disabled"
   rm -rf "$tmp" "$runbase"
 }
 
 test_preserve_clipboard_non_strict_falls_back_to_paste() {
-  local tmp fakebin runbase logfile xclip_write_marker xdotool_type_marker
+  local tmp fakebin runbase logfile xclip_write_marker xdotool_args_marker xdotool_type_marker
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-clipboard-nonstrict-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-clipboard-nonstrict-$$-$RANDOM"
   mkdir -p "$runbase"
   xclip_write_marker="$tmp/xclip_write.log"
+  xdotool_args_marker="$tmp/xdotool_args.log"
   xdotool_type_marker="$tmp/xdotool_type.log"
 
   write_fake_pw_record "$fakebin"
   write_fake_curl "$fakebin"
   write_fake_jq "$fakebin"
   write_fake_sox "$fakebin"
-  write_fake_xclip_read_fail "$fakebin"
-  write_fake_xdotool_capture_type "$fakebin"
+  write_fake_xclip_capture_clipboard "$fakebin"
+  write_fake_xdotool_capture_args "$fakebin"
 
   (
     export PATH="$fakebin:$PATH"
@@ -1273,10 +1382,12 @@ test_preserve_clipboard_non_strict_falls_back_to_paste() {
     export S2T_INSERT_METHOD=paste
     export S2T_PRESERVE_CLIPBOARD=1
     export S2T_PRESERVE_CLIPBOARD_STRICT=0
+    export S2T_X11_SECONDARY_AUTO_INSERT=1
     export S2T_USE_SERVER=1
     export FAKE_CURL_TEXT="clipboard-nonstrict"
+    export FAKE_XCLIP_CLIPBOARD_READ_TEXT="previous-clipboard"
     export FAKE_XCLIP_WRITE_MARKER="$xclip_write_marker"
-    export FAKE_XDOTOOL_TYPE_MARKER="$xdotool_type_marker"
+    export FAKE_XDOTOOL_ARGS_MARKER="$xdotool_args_marker"
     "$controller" start
     sleep 0.25
     "$controller" stop
@@ -1284,9 +1395,157 @@ test_preserve_clipboard_non_strict_falls_back_to_paste() {
 
   logfile="$runbase/s2t/s2t.log"
   [ -f "$logfile" ] || fail "log file missing in non-strict clipboard test"
-  rg -q "proceeding with paste without clipboard restore" "$logfile" || fail "non-strict clipboard fallback log missing"
-  [ -f "$xclip_write_marker" ] || fail "paste path did not write clipboard in non-strict mode"
-  [ ! -f "$xdotool_type_marker" ] || fail "typing fallback used unexpectedly in non-strict mode"
+  rg -q "insert: pasted-via-clipboard-transport" "$logfile" || fail "expected clipboard transport insert log missing"
+  [ -f "$xdotool_args_marker" ] || fail "xdotool key shortcut was not used"
+  rg -q "key --clearmodifiers" "$xdotool_args_marker" || fail "xdotool key shortcut log missing"
+  [ ! -f "$xdotool_type_marker" ] || fail "xdotool type should not be used in clipboard transport mode"
+  rg -q "selection=clipboard payload=clipboard-nonstrict" "$xclip_write_marker" || fail "temporary clipboard payload was not written"
+  rg -q "selection=clipboard payload=previous-clipboard" "$xclip_write_marker" || fail "previous clipboard was not restored"
+
+  rm -rf "$tmp" "$runbase"
+}
+
+test_x11_secondary_auto_insert_disabled_runtime() {
+  local tmp fakebin runbase logfile xdotool_type_marker secondary_file
+  tmp="$(mktemp -d)"
+  fakebin="$tmp/bin"
+  mkdir -p "$fakebin"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-x11-secondary-auto-off-$$-$RANDOM"
+  mkdir -p "$runbase"
+  xdotool_type_marker="$tmp/xdotool_type.log"
+  secondary_file="$runbase/s2t/secondary_buffer.txt"
+
+  write_fake_pw_record "$fakebin"
+  write_fake_curl "$fakebin"
+  write_fake_jq "$fakebin"
+  write_fake_sox "$fakebin"
+  write_fake_xclip "$fakebin"
+  write_fake_xdotool_capture_type "$fakebin"
+
+  (
+    export PATH="$fakebin:$PATH"
+    export XDG_RUNTIME_DIR="$runbase"
+    export XDG_SESSION_TYPE=x11
+    export S2T_PREPEND_RESULT_BIN=0
+    export S2T_INSERT_METHOD=paste
+    export S2T_X11_SECONDARY_AUTO_INSERT=0
+    export S2T_USE_SERVER=1
+    export FAKE_CURL_TEXT="secondary-buffer-only"
+    export FAKE_XDOTOOL_TYPE_MARKER="$xdotool_type_marker"
+    "$controller" start
+    sleep 0.25
+    "$controller" stop
+  )
+
+  logfile="$runbase/s2t/s2t.log"
+  [ -f "$logfile" ] || fail "log file missing in X11 secondary auto-insert test"
+  rg -q "insert: skipped auto insert on X11; transcript kept in secondary buffer" "$logfile" || fail "expected X11 auto-insert skip log"
+  [ ! -f "$xdotool_type_marker" ] || fail "xdotool type should not be used for X11 auto-insert by default"
+  [ -f "$secondary_file" ] || fail "secondary buffer file missing after auto-insert skip"
+  rg -q "secondary-buffer-only" "$secondary_file" || fail "secondary buffer does not contain transcript"
+
+  rm -rf "$tmp" "$runbase"
+}
+
+test_x11_manual_secondary_paste_timeout_guard_runtime() {
+  local tmp fakebin runbase logfile start_ts end_ts elapsed
+  tmp="$(mktemp -d)"
+  fakebin="$tmp/bin"
+  mkdir -p "$fakebin"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-x11-secondary-timeout-$$-$RANDOM"
+  mkdir -p "$runbase/s2t"
+
+  write_fake_xdotool_hang_on_type "$fakebin"
+  write_fake_xclip_capture_clipboard "$fakebin"
+
+  printf 'manual-timeout-check' >"$runbase/s2t/secondary_buffer.txt"
+
+  (
+    export PATH="$fakebin:$PATH"
+    export XDG_RUNTIME_DIR="$runbase"
+    export XDG_SESSION_TYPE=x11
+    export S2T_PREPEND_RESULT_BIN=0
+    export S2T_X11_SECONDARY_MANUAL_PASTE=1
+    export S2T_X11_TYPE_TIMEOUT_SEC=1
+    export FAKE_XCLIP_CLIPBOARD_READ_TEXT="before-manual"
+    start_ts="$(date +%s)"
+    if "$controller" secondary-paste; then
+      fail "secondary-paste unexpectedly succeeded despite hanging xdotool"
+    fi
+    end_ts="$(date +%s)"
+    elapsed=$((end_ts - start_ts))
+    if [ "$elapsed" -gt 5 ]; then
+      fail "secondary-paste timeout guard took too long (elapsed=${elapsed}s)"
+    fi
+  )
+
+  logfile="$runbase/s2t/s2t.log"
+  [ -f "$logfile" ] || fail "log file missing in X11 secondary timeout guard test"
+  rg -q "manual-secondary: paste failed" "$logfile" || fail "expected manual secondary paste failure log"
+
+  rm -rf "$tmp" "$runbase"
+}
+
+test_manual_secondary_paste_waits_for_fresh_transcript_runtime() {
+  local tmp fakebin runbase logfile xclip_write_marker xdotool_args_marker secondary_file start_ts end_ts elapsed
+  tmp="$(mktemp -d)"
+  fakebin="$tmp/bin"
+  mkdir -p "$fakebin"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-secondary-fresh-wait-$$-$RANDOM"
+  mkdir -p "$runbase/s2t"
+  xclip_write_marker="$tmp/xclip_write.log"
+  xdotool_args_marker="$tmp/xdotool_args.log"
+  secondary_file="$runbase/s2t/secondary_buffer.txt"
+
+  write_fake_pw_record "$fakebin"
+  write_fake_jq "$fakebin"
+  write_fake_sox "$fakebin"
+  write_fake_xclip_capture_clipboard "$fakebin"
+  write_fake_xdotool_capture_args "$fakebin"
+  cat >"$fakebin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+sleep 1
+printf '{"text":"fresh-after-wait"}\n'
+EOF
+  chmod +x "$fakebin/curl"
+
+  printf 'stale-before-wait' >"$secondary_file"
+
+  (
+    export PATH="$fakebin:$PATH"
+    export XDG_RUNTIME_DIR="$runbase"
+    export XDG_SESSION_TYPE=x11
+    export S2T_PREPEND_RESULT_BIN=0
+    export S2T_INSERT_METHOD=none
+    export S2T_USE_SERVER=1
+    export S2T_X11_SECONDARY_MANUAL_PASTE=1
+    export S2T_SECONDARY_WAIT_FOR_FRESH_MS=4000
+    export FAKE_XCLIP_CLIPBOARD_READ_TEXT="clipboard-before-fresh-wait"
+    export FAKE_XCLIP_WRITE_MARKER="$xclip_write_marker"
+    export FAKE_XDOTOOL_ARGS_MARKER="$xdotool_args_marker"
+
+    "$controller" start
+    sleep 0.25
+    "$controller" stop &
+    sleep 0.15
+
+    start_ts="$(date +%s)"
+    "$controller" secondary-paste
+    end_ts="$(date +%s)"
+    elapsed=$((end_ts - start_ts))
+    if [ "$elapsed" -gt 6 ]; then
+      fail "secondary-paste waited too long for fresh transcript (elapsed=${elapsed}s)"
+    fi
+  )
+
+  logfile="$runbase/s2t/s2t.log"
+  [ -f "$logfile" ] || fail "log file missing in secondary fresh-wait test"
+  rg -q "manual-secondary: waiting for active transcribe before paste" "$logfile" || fail "manual paste did not wait for active transcribe"
+  rg -q "manual-secondary: pasted via secondary buffer len=17" "$logfile" || fail "manual paste did not use fresh transcript"
+  rg -q "fresh-after-wait" "$secondary_file" || fail "secondary buffer was not refreshed with latest transcript"
+  rg -q "selection=clipboard payload=fresh-after-wait" "$xclip_write_marker" || fail "manual paste did not transport the fresh transcript"
+  [ -f "$xdotool_args_marker" ] || fail "paste shortcut was not triggered after waiting for fresh transcript"
 
   rm -rf "$tmp" "$runbase"
 }
@@ -1521,7 +1780,7 @@ test_submit_correction_pairs_audio_with_manual_text_runtime() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-submit-correction-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-submit-correction-$$-$RANDOM"
   datahome="$runbase/data"
   raw_dir="$datahome/s2t/dataset/raw"
   queue_dir="$datahome/s2t/dataset/queue"
@@ -1572,7 +1831,7 @@ test_submit_correction_maps_latest_contiguous_cluster_runtime() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-submit-cluster-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-submit-cluster-$$-$RANDOM"
   datahome="$runbase/data"
   raw_dir="$datahome/s2t/dataset/raw"
   queue_dir="$datahome/s2t/dataset/queue"
@@ -1632,7 +1891,7 @@ test_submit_correction_with_id_keeps_cluster_runtime() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-submit-cluster-id-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-submit-cluster-id-$$-$RANDOM"
   datahome="$runbase/data"
   raw_dir="$datahome/s2t/dataset/raw"
   pending_dir="$datahome/s2t/dataset/pending"
@@ -1695,7 +1954,7 @@ test_pending_only_until_submit_runtime() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-pending-only-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-pending-only-$$-$RANDOM"
   datahome="$runbase/data"
   raw_dir="$datahome/s2t/dataset/raw"
   pending_dir="$datahome/s2t/dataset/pending"
@@ -1743,7 +2002,7 @@ test_pending_only_until_submit_runtime() {
 test_rabbitmq_backend_enqueue_runtime() {
   local tmp runbase datahome raw_dir queue_dir pending_dir marker publisher corrected queue_jobs txt_count sid now_ms
   tmp="$(mktemp -d)"
-  runbase="/dev/shm/s2t-test-rabbit-enqueue-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-rabbit-enqueue-$$-$RANDOM"
   datahome="$runbase/data"
   raw_dir="$datahome/s2t/dataset/raw"
   queue_dir="$datahome/s2t/dataset/queue"
@@ -1809,7 +2068,7 @@ EOF
 test_rabbitmq_backend_fallback_to_file_queue_runtime() {
   local tmp runbase datahome queue_dir pending_dir marker publisher corrected queue_jobs logfile sid now_ms
   tmp="$(mktemp -d)"
-  runbase="/dev/shm/s2t-test-rabbit-fallback-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-rabbit-fallback-$$-$RANDOM"
   datahome="$runbase/data"
   queue_dir="$datahome/s2t/dataset/queue"
   pending_dir="$datahome/s2t/dataset/pending"
@@ -1869,7 +2128,7 @@ test_controller_autoloads_user_env_runtime() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-env-autoload-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-env-autoload-$$-$RANDOM"
   datahome="$runbase/data"
   home_dir="$tmp/home"
   args_file="$tmp/curl.args"
@@ -1914,7 +2173,7 @@ test_codex_bridge_submits_recent_user_message_runtime() {
   tmp="$(mktemp -d)"
   home_dir="$tmp/home"
   sessions_dir="$home_dir/.codex/sessions/2026/02/21"
-  runbase="/dev/shm/s2t-test-codex-bridge-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-codex-bridge-$$-$RANDOM"
   datahome="$runbase/data"
   pending_dir="$datahome/s2t/dataset/pending"
   marker="$tmp/submitted.txt"
@@ -1990,7 +2249,7 @@ test_codex_bridge_skips_log_like_messages_runtime() {
   tmp="$(mktemp -d)"
   home_dir="$tmp/home"
   sessions_dir="$home_dir/.codex/sessions/2026/02/21"
-  runbase="/dev/shm/s2t-test-codex-bridge-skip-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-codex-bridge-skip-$$-$RANDOM"
   datahome="$runbase/data"
   pending_dir="$datahome/s2t/dataset/pending"
   marker="$tmp/submitted.txt"
@@ -2062,7 +2321,7 @@ test_codex_bridge_matches_delayed_best_pending_runtime() {
   tmp="$(mktemp -d)"
   home_dir="$tmp/home"
   sessions_dir="$home_dir/.codex/sessions/2026/02/21"
-  runbase="/dev/shm/s2t-test-codex-bridge-delayed-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-codex-bridge-delayed-$$-$RANDOM"
   datahome="$runbase/data"
   pending_dir="$datahome/s2t/dataset/pending"
   state_file="$tmp/state.json"
@@ -2165,7 +2424,7 @@ test_local_provider_server_request_has_no_timeout_runtime() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-local-no-timeout-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-local-no-timeout-$$-$RANDOM"
   mkdir -p "$runbase"
   curl_args="$tmp/curl_args.txt"
 
@@ -2201,12 +2460,56 @@ test_local_provider_server_request_has_no_timeout_runtime() {
   rm -rf "$tmp" "$runbase"
 }
 
+test_cloud_fallback_server_uses_dynamic_timeout_runtime() {
+  local tmp fakebin runbase logfile curl_args transcript_file
+  tmp="$(mktemp -d)"
+  fakebin="$tmp/bin"
+  mkdir -p "$fakebin"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-cloud-fallback-server-timeout-$$-$RANDOM"
+  mkdir -p "$runbase"
+  curl_args="$tmp/curl_args.txt"
+
+  write_fake_pw_record "$fakebin"
+  write_fake_curl_capture_args "$fakebin"
+  write_fake_jq "$fakebin"
+  write_fake_sox "$fakebin"
+
+  (
+    export PATH="$fakebin:$PATH"
+    export XDG_RUNTIME_DIR="$runbase"
+    export S2T_PREPEND_RESULT_BIN=0
+    export S2T_INSERT_METHOD=none
+    export S2T_ASR_PROVIDER=gcp-l4
+    export S2T_GCP_WHISPER_URL=
+    export S2T_USE_SERVER=1
+    export S2T_SERVER_TIMEOUT_SEC=4
+    export S2T_SERVER_DYNAMIC_TIMEOUT=1
+    export S2T_SERVER_TIMEOUT_PER_AUDIO_SEC=0.5
+    export S2T_SERVER_TIMEOUT_MAX_SEC=90
+    export FAKE_SOX_DURATION=20.000000
+    export FAKE_CURL_ARGS_FILE="$curl_args"
+    "$controller" start
+    "$controller" stop
+  )
+
+  logfile="$runbase/s2t/s2t.log"
+  transcript_file="$runbase/s2t/last_transcript.txt"
+  [ -f "$logfile" ] || fail "log file missing in cloud fallback dynamic-timeout test"
+  [ -f "$curl_args" ] || fail "server request args missing in cloud fallback dynamic-timeout test"
+  [ -f "$transcript_file" ] || fail "missing transcript in cloud fallback dynamic-timeout test"
+  rg -q -- "--max-time" "$curl_args" || fail "cloud fallback server request did not include timeout flag"
+  rg -q -- "^14$" "$curl_args" || fail "cloud fallback server timeout did not scale above base timeout for long audio"
+  rg -q "gcp-l4 empty/fail; falling back to local" "$logfile" || fail "expected cloud fallback log missing"
+
+  rm -rf "$tmp" "$runbase"
+}
+
 test_google_long_audio_dynamic_timeout_runtime() {
   local tmp fakebin runbase real_python transcript_file logfile
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-google-dynamic-timeout-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-google-dynamic-timeout-$$-$RANDOM"
   mkdir -p "$runbase"
   real_python="$(command -v python3)"
 
@@ -2248,12 +2551,58 @@ test_google_long_audio_dynamic_timeout_runtime() {
   rm -rf "$tmp" "$runbase"
 }
 
+test_gcp_l4_long_audio_dynamic_timeout_runtime() {
+  local tmp fakebin runbase transcript_file logfile curl_args
+  tmp="$(mktemp -d)"
+  fakebin="$tmp/bin"
+  mkdir -p "$fakebin"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-gcp-dynamic-timeout-$$-$RANDOM"
+  mkdir -p "$runbase"
+  curl_args="$tmp/curl_args.txt"
+
+  write_fake_pw_record "$fakebin"
+  write_fake_curl_capture_args "$fakebin"
+  write_fake_jq "$fakebin"
+  write_fake_sox "$fakebin"
+
+  (
+    export PATH="$fakebin:$PATH"
+    export XDG_RUNTIME_DIR="$runbase"
+    export S2T_PREPEND_RESULT_BIN=0
+    export S2T_INSERT_METHOD=none
+    export S2T_ASR_PROVIDER=gcp-l4
+    export S2T_GCP_WHISPER_URL=https://example.invalid
+    export S2T_GCP_WHISPER_TIMEOUT_SEC=5
+    export S2T_GCP_WHISPER_DYNAMIC_TIMEOUT=1
+    export S2T_GCP_WHISPER_TIMEOUT_PER_AUDIO_SEC=0.5
+    export S2T_GCP_WHISPER_TIMEOUT_MAX_SEC=90
+    export S2T_MAX_RESPONSE_SECONDS=5
+    export S2T_USE_SERVER=0
+    export FAKE_SOX_DURATION=20.000000
+    export FAKE_CURL_ARGS_FILE="$curl_args"
+    "$controller" start
+    "$controller" stop
+  )
+
+  transcript_file="$runbase/s2t/last_transcript.txt"
+  logfile="$runbase/s2t/s2t.log"
+  [ -f "$transcript_file" ] || fail "missing transcript in gcp-l4 dynamic-timeout test"
+  [ -f "$curl_args" ] || fail "curl args missing in gcp-l4 dynamic-timeout test"
+  rg -q -- "--max-time" "$curl_args" || fail "gcp-l4 request did not include timeout flag"
+  rg -q -- "^15$" "$curl_args" || fail "gcp-l4 dynamic timeout did not scale above base timeout for long audio"
+  if rg -q "gcp-l4 empty/fail" "$logfile"; then
+    fail "unexpected gcp-l4 fallback in dynamic-timeout test"
+  fi
+
+  rm -rf "$tmp" "$runbase"
+}
+
 test_google_mid_audio_prefers_long_model_runtime() {
   local tmp fakebin runbase real_python logfile
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-google-mid-audio-model-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-google-mid-audio-model-$$-$RANDOM"
   mkdir -p "$runbase"
   real_python="$(command -v python3)"
 
@@ -2294,7 +2643,7 @@ test_google_v2_fallback() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-gv2-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-gv2-$$-$RANDOM"
   mkdir -p "$runbase"
   creds="$tmp/creds.json"
   echo '{}' >"$creds"
@@ -2332,7 +2681,7 @@ test_audio_target_prefers_real_source_over_loopback_runtime() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-audio-source-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-audio-source-$$-$RANDOM"
   mkdir -p "$runbase"
   args_file="$tmp/pw-record.args"
   inspect_file="$tmp/wpctl.inspect"
@@ -2390,7 +2739,7 @@ test_audio_target_ignores_missing_configured_source_runtime() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-audio-missing-source-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-audio-missing-source-$$-$RANDOM"
   mkdir -p "$runbase"
   args_file="$tmp/pw-record.args"
   inspect_file="$tmp/wpctl.inspect"
@@ -2449,7 +2798,7 @@ test_alsa_capture_fallback_runtime() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-alsa-fallback-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-alsa-fallback-$$-$RANDOM"
   mkdir -p "$runbase"
   pw_args_file="$tmp/pw-record.args"
   arecord_args_file="$tmp/arecord.args"
@@ -2519,7 +2868,7 @@ test_google_v1_empty_retries_google_v2_runtime() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-google-v1-v2-retry-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-google-v1-v2-retry-$$-$RANDOM"
   mkdir -p "$runbase"
   creds="$tmp/creds.json"
   real_python="$(command -v python3)"
@@ -2565,7 +2914,7 @@ test_google_empty_retries_without_alt_languages_runtime() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-google-no-alt-retry-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-google-no-alt-retry-$$-$RANDOM"
   mkdir -p "$runbase"
   real_python="$(command -v python3)"
 
@@ -2608,7 +2957,7 @@ test_google_empty_alt_config_is_respected_runtime() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-google-empty-alt-config-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-google-empty-alt-config-$$-$RANDOM"
   mkdir -p "$runbase"
   real_python="$(command -v python3)"
 
@@ -2650,7 +2999,7 @@ test_google_short_result_guard_retries_without_alt_languages_runtime() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-google-short-guard-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-google-short-guard-$$-$RANDOM"
   mkdir -p "$runbase"
   real_python="$(command -v python3)"
 
@@ -2695,7 +3044,7 @@ test_unset_xdg_session_type_type_mode() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-xdg-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-xdg-$$-$RANDOM"
   mkdir -p "$runbase"
 
   write_fake_pw_record "$fakebin"
@@ -2728,7 +3077,7 @@ test_log_rotation() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-log-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-log-$$-$RANDOM"
   mkdir -p "$runbase"
 
   write_fake_pw_record "$fakebin"
@@ -2768,7 +3117,7 @@ test_whisper_artifact_pruning() {
   tmp="$(mktemp -d)"
   fakebin="$tmp/bin"
   mkdir -p "$fakebin"
-  runbase="/dev/shm/s2t-test-whisper-$$-$RANDOM"
+  runbase="$S2T_TEST_RUNTIME_BASE/s2t-test-whisper-$$-$RANDOM"
   mkdir -p "$runbase"
   model="$tmp/model.bin"
   echo "dummy" >"$model"
@@ -2828,6 +3177,7 @@ run_test "monitor global lock support" test_monitor_global_lock_support
 run_test "monitor hotkey resilience controls" test_monitor_hotkey_resilience_controls_present
 run_test "systemd cgroup limits present" test_systemd_cgroup_limits_present
 run_test "dataset etl service setup" test_dataset_etl_service_setup_present
+run_test "whisper cloud keepalive setup" test_whisper_cloud_keepalive_setup_present
 run_test "codex bridge service setup" test_codex_bridge_service_setup_present
 run_test "rabbitmq queue setup" test_rabbitmq_queue_setup_present
 run_test "dataset etl llm validation controls" test_dataset_etl_llm_validation_controls_present
@@ -2845,6 +3195,9 @@ run_test "drop when busy prevents queue" test_drop_when_busy_prevents_transcribe
 run_test "stale transcribe lock recovery" test_stale_transcribe_lock_recovery_runtime
 run_test "preserve clipboard fallback" test_preserve_clipboard_no_overwrite_on_snapshot_failure
 run_test "preserve clipboard non-strict fallback" test_preserve_clipboard_non_strict_falls_back_to_paste
+run_test "x11 secondary auto insert disabled" test_x11_secondary_auto_insert_disabled_runtime
+run_test "x11 manual secondary paste timeout guard" test_x11_manual_secondary_paste_timeout_guard_runtime
+run_test "manual secondary paste waits for fresh transcript" test_manual_secondary_paste_waits_for_fresh_transcript_runtime
 run_test "google response-timeout after send logic" test_google_response_timeout_after_send_logic
 run_test "dataset builder pipeline" test_dataset_builder_pipeline_runtime
 run_test "dataset etl llm accept" test_dataset_etl_llm_accept_runtime
@@ -2860,7 +3213,9 @@ run_test "codex bridge submits recent user message" test_codex_bridge_submits_re
 run_test "codex bridge skips log-like messages" test_codex_bridge_skips_log_like_messages_runtime
 run_test "codex bridge matches delayed best pending" test_codex_bridge_matches_delayed_best_pending_runtime
 run_test "local server request has no timeout" test_local_provider_server_request_has_no_timeout_runtime
+run_test "cloud fallback server uses dynamic timeout" test_cloud_fallback_server_uses_dynamic_timeout_runtime
 run_test "google long audio dynamic timeout" test_google_long_audio_dynamic_timeout_runtime
+run_test "gcp-l4 long audio dynamic timeout" test_gcp_l4_long_audio_dynamic_timeout_runtime
 run_test "google mid audio prefers long model" test_google_mid_audio_prefers_long_model_runtime
 run_test "google v2 fallback" test_google_v2_fallback
 run_test "audio target prefers real source" test_audio_target_prefers_real_source_over_loopback_runtime

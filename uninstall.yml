@@ -55,6 +55,17 @@
         XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
       ignore_errors: yes
 
+    - name: Stop and disable s2t-whisper-cloud-keepalive user service
+      systemd:
+        name: s2t-whisper-cloud-keepalive
+        scope: user
+        state: stopped
+        enabled: no
+      become_user: "{{ s2t_target_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
+      ignore_errors: yes
+
     - name: Stop and disable s2t-dataset-etl user service
       systemd:
         name: s2t-dataset-etl
@@ -118,6 +129,11 @@
     - name: Remove s2t-whisper unit
       file:
         path: "{{ s2t_target_home }}/.config/systemd/user/s2t-whisper.service"
+        state: absent
+
+    - name: Remove s2t-whisper-cloud-keepalive unit
+      file:
+        path: "{{ s2t_target_home }}/.config/systemd/user/s2t-whisper-cloud-keepalive.service"
         state: absent
 
     - name: Remove s2t-dataset-etl unit

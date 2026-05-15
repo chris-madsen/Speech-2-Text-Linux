@@ -25,6 +25,11 @@
       register: svc_whisper
     - assert: { that: svc_whisper.stat.exists }
 
+    - name: Check whisper cloud keepalive unit installed
+      stat: path=/root/.config/systemd/user/s2t-whisper-cloud-keepalive.service
+      register: svc_whisper_cloud_keepalive
+    - assert: { that: svc_whisper_cloud_keepalive.stat.exists }
+
     - name: Check udev rule installed
       stat: path=/etc/udev/rules.d/72-s2t-keyd-seat.rules
       register: udev_rule
@@ -51,7 +56,7 @@
           - "(not libcuda_lib.stat.exists) or tmpfiles_conf.stat.exists"
 
     - name: Verify systemd unit files parse cleanly
-      command: systemd-analyze verify /etc/systemd/system/keyd.service /etc/systemd/system/ydotoold.service /root/.config/systemd/user/s2t-whisper.service /root/.config/systemd/user/s2t-monitor.service
+      command: systemd-analyze verify /etc/systemd/system/keyd.service /etc/systemd/system/ydotoold.service /root/.config/systemd/user/s2t-whisper.service /root/.config/systemd/user/s2t-whisper-cloud-keepalive.service /root/.config/systemd/user/s2t-monitor.service
       register: unit_verify
       changed_when: false
 

@@ -21,6 +21,7 @@
         packages = [
           python
           pkgs.ffmpeg
+          pkgs.teleport
           pkgs.podman
           pkgs.shadow
           pkgs.cudatoolkit

@@ -187,7 +187,7 @@ async def process_pair(
     output_root: Path,
 ) -> Tuple[Sample | None, PipelineError | None]:
     try:
-        raw_text = await asyncio.to_thread(pair.text_path.read_text, encoding="utf-8")
+        raw_text = pair.text_path.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:
         return None, PipelineError(pair.rel_stem, "text_read", f"UTF-8 decode failed: {exc}")
     except OSError as exc:

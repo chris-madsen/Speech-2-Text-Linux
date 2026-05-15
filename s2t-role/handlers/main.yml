@@ -74,3 +74,15 @@
     XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
   failed_when: false
   when: not s2t_skip_service_enable
+
+- name: Restart S2T Whisper Cloud Keepalive (User)
+  systemd:
+    name: s2t-whisper-cloud-keepalive
+    scope: user
+    state: restarted
+    daemon_reload: yes
+  become_user: "{{ s2t_target_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ s2t_target_uid }}"
+  failed_when: false
+  when: not s2t_skip_service_enable

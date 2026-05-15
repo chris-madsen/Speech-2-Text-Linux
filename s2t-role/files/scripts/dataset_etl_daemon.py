@@ -15,6 +15,8 @@ import tempfile
 import time
 from dataclasses import dataclass
 
+from s2t_common import Logger, env_bool, env_float, env_int, env_path, env_str
+
 
 @dataclass
 class Config:
@@ -46,6 +48,7 @@ class Config:
     log_max_bytes: int
     log_keep: int
     python_bin: str
+    requeue_processing_sec: int
 
 
 @dataclass
@@ -57,117 +60,20 @@ class JobSpec:
     queued_ms: int
 
 
-_LOG_FILE: pathlib.Path | None = None
-_LOG_MAX_BYTES: int = 0
-_LOG_KEEP: int = 0
-_LOG_VERBOSE: bool = False
-
-
-def rotate_log_file(path: pathlib.Path, max_bytes: int, keep: int) -> None:
-    if max_bytes <= 0 or keep <= 0:
-        return
-    try:
-        if not path.exists() or path.stat().st_size <= max_bytes:
-            return
-    except OSError:
-        return
-
-    oldest = path.with_name(f"{path.name}.{keep}")
-    try:
-        oldest.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-    for idx in range(keep - 1, 0, -1):
-        src = path.with_name(f"{path.name}.{idx}")
-        dst = path.with_name(f"{path.name}.{idx + 1}")
-        if src.exists():
-            try:
-                src.rename(dst)
-            except OSError:
-                pass
-
-    try:
-        path.rename(path.with_name(f"{path.name}.1"))
-    except OSError:
-        pass
-
-
-def configure_logging(cfg: Config) -> None:
-    global _LOG_FILE, _LOG_MAX_BYTES, _LOG_KEEP, _LOG_VERBOSE
-    _LOG_FILE = cfg.log_file
-    _LOG_MAX_BYTES = cfg.log_max_bytes
-    _LOG_KEEP = cfg.log_keep
-    _LOG_VERBOSE = cfg.log_verbose
-    try:
-        cfg.log_file.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        _LOG_FILE = None
+_LOGGER: Logger | None = None
 
 
 def log(message: str) -> None:
-    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
-    line = f"{ts} {message}"
-    print(line, flush=True)
-    if _LOG_FILE is not None:
-        try:
-            rotate_log_file(_LOG_FILE, _LOG_MAX_BYTES, _LOG_KEEP)
-            with _LOG_FILE.open("a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
-        except OSError:
-            pass
+    if _LOGGER is None:
+        print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}", flush=True)
+        return
+    _LOGGER.log(message)
 
 
 def logv(message: str) -> None:
-    if _LOG_VERBOSE:
-        log(message)
-
-
-def env_int(name: str, default: int, minimum: int = 0) -> int:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        return default
-    if value < minimum:
-        return default
-    return value
-
-
-def env_float(name: str, default: float, minimum: float = 0.0) -> float:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        return default
-    if value < minimum:
-        return default
-    return value
-
-
-def env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name, "").strip().lower()
-    if not raw:
-        return default
-    return raw in {"1", "true", "yes", "on"}
-
-
-def env_path(name: str, default: pathlib.Path) -> pathlib.Path:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    return pathlib.Path(raw).expanduser()
-
-
-def env_str(name: str, default: str) -> str:
-    raw = os.environ.get(name, "")
-    if not raw.strip():
-        return default
-    return raw.strip()
+    if _LOGGER is None:
+        return
+    _LOGGER.logv(message)
 
 
 def clip_text(value: str, limit: int = 1200) -> str:
@@ -175,6 +81,31 @@ def clip_text(value: str, limit: int = 1200) -> str:
     if len(value) <= limit:
         return value
     return value[: limit - 3] + "..."
+
+
+def ensure_writable_dir(path: pathlib.Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    return os.access(path, os.W_OK | os.X_OK)
+
+
+def choose_writable_dir(preferred: pathlib.Path, fallback: pathlib.Path, label: str) -> pathlib.Path:
+    candidate = preferred.expanduser()
+    if ensure_writable_dir(candidate):
+        return candidate
+
+    fallback_dir = fallback.expanduser()
+    if ensure_writable_dir(fallback_dir):
+        print(
+            f"dataset-etl: {label} path '{candidate}' is not writable; using '{fallback_dir}'",
+            file=sys.stderr,
+            flush=True,
+        )
+        return fallback_dir
+
+    return candidate
 
 
 def strip_markdown_fence(value: str) -> str:
@@ -190,11 +121,32 @@ def load_config() -> Config:
     xdg_data_home = pathlib.Path(os.environ.get("XDG_DATA_HOME", str(home / ".local" / "share"))).expanduser()
     xdg_runtime_dir = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/s2t-{os.getuid()}")).expanduser()
 
-    dataset_root = env_path("S2T_DATASET_ROOT", xdg_data_home / "s2t" / "dataset")
-    raw_dir = env_path("S2T_DATASET_RAW_DIR", dataset_root / "raw")
-    queue_dir = env_path("S2T_DATASET_QUEUE_DIR", dataset_root / "queue")
-    output_dir = env_path("S2T_DATASET_OUTPUT_DIR", dataset_root / "hf")
-    quarantine_dir = env_path("S2T_DATASET_QUARANTINE_DIR", dataset_root / "quarantine")
+    default_dataset_root = xdg_data_home / "s2t" / "dataset"
+    dataset_root = choose_writable_dir(
+        env_path("S2T_DATASET_ROOT", default_dataset_root),
+        default_dataset_root,
+        "dataset_root",
+    )
+    raw_dir = choose_writable_dir(
+        env_path("S2T_DATASET_RAW_DIR", dataset_root / "raw"),
+        dataset_root / "raw",
+        "raw_dir",
+    )
+    queue_dir = choose_writable_dir(
+        env_path("S2T_DATASET_QUEUE_DIR", dataset_root / "queue"),
+        dataset_root / "queue",
+        "queue_dir",
+    )
+    output_dir = choose_writable_dir(
+        env_path("S2T_DATASET_OUTPUT_DIR", dataset_root / "hf"),
+        dataset_root / "hf",
+        "output_dir",
+    )
+    quarantine_dir = choose_writable_dir(
+        env_path("S2T_DATASET_QUARANTINE_DIR", dataset_root / "quarantine"),
+        dataset_root / "quarantine",
+        "quarantine_dir",
+    )
     builder_path = env_path("S2T_DATASET_BUILDER", pathlib.Path("/etc/s2t/scripts/build_dataset.py"))
 
     poll_interval = env_float("S2T_DATASET_ETL_INTERVAL_SEC", 2.0, minimum=0.2)
@@ -225,6 +177,7 @@ def load_config() -> Config:
     log_file = env_path("S2T_DATASET_LOG_FILE", xdg_runtime_dir / "s2t" / "dataset-etl.log")
     log_max_bytes = env_int("S2T_DATASET_LOG_MAX_BYTES", 2 * 1024 * 1024, minimum=4096)
     log_keep = env_int("S2T_DATASET_LOG_KEEP", 5, minimum=1)
+    requeue_processing_sec = env_int("S2T_DATASET_REQUEUE_PROCESSING_SEC", 300, minimum=10)
 
     python_bin = shutil.which("python3") or sys.executable
 
@@ -257,6 +210,7 @@ def load_config() -> Config:
         log_max_bytes=log_max_bytes,
         log_keep=log_keep,
         python_bin=python_bin,
+        requeue_processing_sec=requeue_processing_sec,
     )
 
 
@@ -315,6 +269,31 @@ def claim_jobs(queue_dir: pathlib.Path) -> list[pathlib.Path]:
             continue
         claimed.append(processing)
     return claimed
+
+
+def recover_stale_processing_jobs(queue_dir: pathlib.Path, max_age_sec: int) -> int:
+    """Requeue old *.job.processing files back to *.job.
+
+    This makes the file-queue at-least-once even across crashes/restarts.
+    """
+    if max_age_sec <= 0:
+        return 0
+    now = time.time()
+    recovered = 0
+    for path in sorted(queue_dir.glob("*.job.processing")):
+        try:
+            age = now - path.stat().st_mtime
+        except OSError:
+            continue
+        if age < float(max_age_sec):
+            continue
+        dst = path.with_suffix("")
+        try:
+            path.rename(dst)
+        except OSError:
+            continue
+        recovered += 1
+    return recovered
 
 
 def run_dataset_builder(cfg: Config) -> tuple[bool, str]:
@@ -664,7 +643,14 @@ def split_jobs_by_validation(cfg: Config, jobs: list[pathlib.Path]) -> list[path
 
 def main() -> int:
     cfg = load_config()
-    configure_logging(cfg)
+    global _LOGGER
+    _LOGGER = Logger(
+        log_file=cfg.log_file,
+        verbose=cfg.log_verbose,
+        max_bytes=cfg.log_max_bytes,
+        keep=cfg.log_keep,
+        prefix="",
+    )
     ensure_dirs(cfg)
 
     log(
@@ -676,6 +662,10 @@ def main() -> int:
     )
 
     while True:
+        recovered = recover_stale_processing_jobs(cfg.queue_dir, cfg.requeue_processing_sec)
+        if recovered:
+            log(f"dataset-etl: recovered stale processing jobs={recovered}")
+
         jobs = claim_jobs(cfg.queue_dir)
         if not jobs:
             if cfg.run_once:

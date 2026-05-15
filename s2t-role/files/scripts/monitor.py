@@ -13,6 +13,10 @@ import select
 KEY_F24 = evdev.ecodes.KEY_F24
 KEY_RIGHTALT = evdev.ecodes.KEY_RIGHTALT
 KEY_MENU = evdev.ecodes.KEY_MENU
+KEY_LEFTALT = evdev.ecodes.KEY_LEFTALT
+KEY_X = evdev.ecodes.KEY_X
+KEY_C = evdev.ecodes.KEY_C
+KEY_V = evdev.ecodes.KEY_V
 DEFAULT_CONTROLLER = "/etc/s2t/result/bin/s2t-controller"
 CONTROLLER_ENV_VAR = "S2T_CONTROLLER"
 GLOBAL_LOCK_ENV_VAR = "S2T_MONITOR_LOCK_PATH"
@@ -20,10 +24,12 @@ GLOBAL_LOCK_DEFAULT = "/tmp/s2t-monitor-global.lock"
 KEY_PRIMARY_ENV_VAR = "S2T_MONITOR_PRIMARY_KEY"
 KEY_FALLBACK_ENV_VAR = "S2T_MONITOR_FALLBACK_KEYS"
 IDLE_REOPEN_ENV_VAR = "S2T_MONITOR_IDLE_REOPEN_SEC"
+SECONDARY_HOTKEYS_ENV_VAR = "S2T_MONITOR_SECONDARY_HOTKEYS"
 
 DEFAULT_PRIMARY_KEY = "F24"
 DEFAULT_FALLBACK_KEYS = "RIGHTALT,MENU"
 DEFAULT_IDLE_REOPEN_SEC = 90
+DEFAULT_SECONDARY_HOTKEYS = "1"
 
 KEY_NAME_TO_CODE = {
     "F24": KEY_F24,
@@ -63,6 +69,10 @@ def build_target_keys():
         if code not in ordered:
             ordered.append(code)
     return ordered
+
+def secondary_hotkeys_enabled() -> bool:
+    raw = (os.environ.get(SECONDARY_HOTKEYS_ENV_VAR, DEFAULT_SECONDARY_HOTKEYS) or "").strip().lower()
+    return raw not in {"0", "false", "no", "off", ""}
 
 def key_name_for_code(code: int):
     try:
@@ -157,8 +167,16 @@ def main():
     _ = lock_file
 
     target_keys = build_target_keys()
+    secondary_enabled = secondary_hotkeys_enabled()
+    watch_keys = list(target_keys)
+    if secondary_enabled:
+        for code in (KEY_LEFTALT, KEY_X, KEY_C, KEY_V):
+            if code not in watch_keys:
+                watch_keys.append(code)
     target_key_names = ",".join(key_name_for_code(code) for code in target_keys)
     print(f"Hotkey codes: {target_key_names}", flush=True)
+    if secondary_enabled:
+        print("Secondary hotkeys enabled: Alt+X(clear), Alt+C(copy), Alt+V(paste)", flush=True)
     try:
         idle_reopen_sec = int(os.environ.get(IDLE_REOPEN_ENV_VAR, str(DEFAULT_IDLE_REOPEN_SEC)))
     except Exception:
@@ -170,9 +188,11 @@ def main():
     while True:
         keyd_dev = None
         pressed = False
+        left_alt_pressed = False
+        secondary_chord_active = False
 
         while True:
-            keyd_dev, permission_denied = find_input_device(target_keys)
+            keyd_dev, permission_denied = find_input_device(watch_keys)
             if keyd_dev:
                 print(f"Monitoring: {keyd_dev.name} ({keyd_dev.path}) keys={target_key_names}", flush=True)
                 break
@@ -200,10 +220,37 @@ def main():
                 for event in events:
                     if event.type != evdev.ecodes.EV_KEY:
                         continue
-                    if event.code not in target_keys:
+                    if event.code not in watch_keys:
                         continue
                     key_name = key_name_for_code(event.code)
                     idle_since = time.monotonic()
+                    if secondary_enabled and event.code == KEY_LEFTALT:
+                        if event.value == 1:
+                            left_alt_pressed = True
+                        elif event.value == 0:
+                            left_alt_pressed = False
+                            secondary_chord_active = False
+                        continue
+                    if secondary_enabled and left_alt_pressed and event.value == 1 and event.code in (KEY_X, KEY_C, KEY_V):
+                        if secondary_chord_active:
+                            continue
+                        secondary_chord_active = True
+                        if event.code == KEY_X:
+                            action = "secondary-clear"
+                            print("Alt+X -> secondary-clear", flush=True)
+                        elif event.code == KEY_C:
+                            action = "secondary-copy"
+                            print("Alt+C -> secondary-copy", flush=True)
+                        else:
+                            action = "secondary-paste"
+                            print("Alt+V -> secondary-paste", flush=True)
+                        subprocess.Popen(cmd + [action], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                        continue
+                    if secondary_enabled and event.value == 0 and event.code in (KEY_X, KEY_C, KEY_V):
+                        secondary_chord_active = False
+                        continue
+                    if event.code not in target_keys:
+                        continue
                     if event.value == 1 and not pressed:  # Down
                         pressed = True
                         print(f"{key_name} down -> start", flush=True)

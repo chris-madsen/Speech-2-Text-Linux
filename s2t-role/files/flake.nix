@@ -22,6 +22,7 @@
           let
             runtimeDeps = with pkgsSet; [
               whisperPkg
+              teleport
               podman
               shadow
               pipewire

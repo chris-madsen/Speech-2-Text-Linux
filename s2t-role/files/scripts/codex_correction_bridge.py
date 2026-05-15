@@ -16,6 +16,8 @@ import sys
 import time
 from dataclasses import dataclass
 
+from s2t_common import Logger, env_bool, env_float, env_int, env_path, env_str
+
 
 @dataclass
 class Config:
@@ -32,16 +34,14 @@ class Config:
     submit_timeout_sec: int
     backfill_existing: bool
     run_once: bool
+    allow_time_fallback: bool
     log_file: pathlib.Path
     log_verbose: bool
     log_max_bytes: int
     log_keep: int
 
 
-_LOG_FILE: pathlib.Path | None = None
-_LOG_VERBOSE: bool = False
-_LOG_MAX_BYTES: int = 0
-_LOG_KEEP: int = 0
+_LOGGER: Logger | None = None
 
 
 @dataclass
@@ -51,112 +51,42 @@ class PendingSample:
     raw_text: str
 
 
-def env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name, "").strip().lower()
-    if not raw:
-        return default
-    return raw in {"1", "true", "yes", "on"}
-
-
-def env_int(name: str, default: int, minimum: int = 0) -> int:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        return default
-    if value < minimum:
-        return default
-    return value
-
-
-def env_float(name: str, default: float, minimum: float = 0.0) -> float:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        return default
-    if value < minimum:
-        return default
-    return value
-
-
-def env_path(name: str, default: pathlib.Path) -> pathlib.Path:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    return pathlib.Path(raw).expanduser()
-
-
-def env_str(name: str, default: str) -> str:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    return raw
-
-
-def rotate_log_file(path: pathlib.Path, max_bytes: int, keep: int) -> None:
-    if max_bytes <= 0 or keep <= 0:
-        return
-    try:
-        if not path.exists() or path.stat().st_size <= max_bytes:
-            return
-    except OSError:
-        return
-
-    oldest = path.with_name(f"{path.name}.{keep}")
-    try:
-        oldest.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-    for idx in range(keep - 1, 0, -1):
-        src = path.with_name(f"{path.name}.{idx}")
-        dst = path.with_name(f"{path.name}.{idx + 1}")
-        if src.exists():
-            try:
-                src.rename(dst)
-            except OSError:
-                pass
-
-    try:
-        path.rename(path.with_name(f"{path.name}.1"))
-    except OSError:
-        pass
-
-
-def configure_logging(cfg: Config) -> None:
-    global _LOG_FILE, _LOG_VERBOSE, _LOG_MAX_BYTES, _LOG_KEEP
-    _LOG_FILE = cfg.log_file
-    _LOG_VERBOSE = cfg.log_verbose
-    _LOG_MAX_BYTES = cfg.log_max_bytes
-    _LOG_KEEP = cfg.log_keep
-    try:
-        cfg.log_file.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        _LOG_FILE = None
-
-
 def log(message: str) -> None:
-    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
-    line = f"{ts} codex-bridge: {message}"
-    print(line, flush=True)
-    if _LOG_FILE is None:
+    if _LOGGER is None:
+        print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} codex-bridge: {message}", flush=True)
         return
-    try:
-        rotate_log_file(_LOG_FILE, _LOG_MAX_BYTES, _LOG_KEEP)
-        with _LOG_FILE.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-    except OSError:
-        pass
+    _LOGGER.log(message)
 
 
 def logv(message: str) -> None:
-    if _LOG_VERBOSE:
-        log(message)
+    if _LOGGER is None:
+        return
+    _LOGGER.logv(message)
+
+
+def ensure_writable_dir(path: pathlib.Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    return os.access(path, os.W_OK | os.X_OK)
+
+
+def choose_writable_dir(preferred: pathlib.Path, fallback: pathlib.Path, label: str) -> pathlib.Path:
+    candidate = preferred.expanduser()
+    if ensure_writable_dir(candidate):
+        return candidate
+
+    fallback_dir = fallback.expanduser()
+    if ensure_writable_dir(fallback_dir):
+        print(
+            f"codex-bridge: {label} path '{candidate}' is not writable; using '{fallback_dir}'",
+            file=sys.stderr,
+            flush=True,
+        )
+        return fallback_dir
+
+    return candidate
 
 
 def load_config() -> Config:
@@ -165,16 +95,31 @@ def load_config() -> Config:
     xdg_runtime = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/s2t-{uid}"))
     xdg_state = pathlib.Path(os.environ.get("XDG_STATE_HOME", str(home / ".local" / "state")))
     xdg_data = pathlib.Path(os.environ.get("XDG_DATA_HOME", str(home / ".local" / "share")))
-    dataset_root = env_path("S2T_DATASET_ROOT", xdg_data / "s2t" / "dataset")
-    pending_dir = env_path("S2T_DATASET_PENDING_DIR", dataset_root / "pending")
+    default_dataset_root = xdg_data / "s2t" / "dataset"
+    dataset_root = choose_writable_dir(
+        env_path("S2T_DATASET_ROOT", default_dataset_root),
+        default_dataset_root,
+        "dataset_root",
+    )
+    pending_dir = choose_writable_dir(
+        env_path("S2T_DATASET_PENDING_DIR", dataset_root / "pending"),
+        dataset_root / "pending",
+        "pending_dir",
+    )
 
     sessions_dir = env_path("S2T_CODEX_SESSIONS_DIR", home / ".codex" / "sessions")
     state_file = env_path("S2T_CODEX_BRIDGE_STATE_FILE", xdg_state / "s2t" / "codex-bridge-state.json")
 
-    controller_raw = env_str("S2T_CODEX_BRIDGE_CONTROLLER", env_str("S2T_CONTROLLER", "/etc/s2t/scripts/controller.sh"))
+    controller_raw = env_str(
+        "S2T_CODEX_BRIDGE_CONTROLLER",
+        env_str("S2T_CONTROLLER", "/etc/s2t/result/bin/s2t-controller"),
+    )
     controller_cmd = shlex.split(controller_raw)
     if not controller_cmd:
-        controller_cmd = ["/etc/s2t/scripts/controller.sh"]
+        controller_cmd = ["/etc/s2t/result/bin/s2t-controller"]
+
+    if not pathlib.Path(controller_cmd[0]).exists():
+        controller_cmd[0] = "/etc/s2t/scripts/controller.sh"
 
     if not pathlib.Path(controller_cmd[0]).is_absolute():
         resolved = shutil.which(controller_cmd[0])
@@ -195,6 +140,7 @@ def load_config() -> Config:
         submit_timeout_sec=env_int("S2T_CODEX_BRIDGE_SUBMIT_TIMEOUT_SEC", 20, minimum=2),
         backfill_existing=env_bool("S2T_CODEX_BRIDGE_BACKFILL_EXISTING", False),
         run_once=env_bool("S2T_CODEX_BRIDGE_RUN_ONCE", False),
+        allow_time_fallback=env_bool("S2T_CODEX_BRIDGE_TIME_FALLBACK", True),
         log_file=env_path("S2T_CODEX_BRIDGE_LOG_FILE", xdg_runtime / "s2t" / "codex-bridge.log"),
         log_verbose=env_bool("S2T_CODEX_BRIDGE_LOG_VERBOSE", True),
         log_max_bytes=env_int("S2T_CODEX_BRIDGE_LOG_MAX_BYTES", 1024 * 1024, minimum=4096),
@@ -507,6 +453,9 @@ def select_pending_fallback_by_time(
         return None
     window_ms = int(cfg.window_sec * 1000)
 
+    if not cfg.allow_time_fallback:
+        return None
+
     in_window: list[PendingSample] = []
     for pending in candidates:
         delta_ms = msg_ms - pending.created_ms
@@ -630,7 +579,14 @@ def main() -> int:
         return 0
 
     cfg = load_config()
-    configure_logging(cfg)
+    global _LOGGER
+    _LOGGER = Logger(
+        log_file=cfg.log_file,
+        verbose=cfg.log_verbose,
+        max_bytes=cfg.log_max_bytes,
+        keep=cfg.log_keep,
+        prefix="codex-bridge: ",
+    )
     cfg.pending_dir.mkdir(parents=True, exist_ok=True)
     state = load_state(cfg.state_file)
 

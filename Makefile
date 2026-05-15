@@ -1,7 +1,7 @@
 PLAYBOOK_INSTALL := install.yml
 PLAYBOOK_UNINSTALL := uninstall.yml
 
-.PHONY: install clean remove uninstall test test-playbooks install-both uninstall-both dataset-build
+.PHONY: install clean remove uninstall test test-playbooks install-both uninstall-both dataset-build deploy-gcp-l4 install-gcp-l4-keepalive uninstall-gcp-l4-keepalive
 
 VENV ?= .venv
 S2T_USER ?=
@@ -11,6 +11,9 @@ DATASET_OUTPUT ?= data/dataset
 DATASET_TEST_RATIO ?= 0.1
 DATASET_JOBS ?= 4
 DATASET_SEED ?= 42
+PROJECT_ID ?=
+REGION ?= europe-north1
+SERVICE_NAME ?= whisper-l4
 
 ANSIBLE_PLAYBOOK := $(if $(wildcard $(VENV)/bin/ansible-playbook),$(abspath $(VENV))/bin/ansible-playbook,ansible-playbook)
 MOLECULE := $(if $(wildcard $(VENV)/bin/molecule),$(abspath $(VENV))/bin/molecule,molecule)
@@ -64,3 +67,13 @@ dataset-build:
 		--test-ratio "$(DATASET_TEST_RATIO)" \
 		--jobs "$(DATASET_JOBS)" \
 		--seed "$(DATASET_SEED)"
+
+deploy-gcp-l4:
+	@if [ -z "$(PROJECT_ID)" ]; then echo "PROJECT_ID is required, e.g. make deploy-gcp-l4 PROJECT_ID=my-project"; exit 1; fi
+	PROJECT_ID="$(PROJECT_ID)" REGION="$(REGION)" SERVICE_NAME="$(SERVICE_NAME)" ./whisper-l4/deploy_cloud_run.sh
+
+install-gcp-l4-keepalive:
+	sudo ./whisper-l4/keepalive/install_keepalive.sh
+
+uninstall-gcp-l4-keepalive:
+	sudo ./whisper-l4/keepalive/uninstall_keepalive.sh

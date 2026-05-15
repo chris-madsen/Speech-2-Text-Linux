@@ -1672,7 +1672,7 @@ try:
 except Exception:
     raise SystemExit(0)
 
-project = (data.get("project_id") or "").strip()
+project = (data.get("project_id") or data.get("quota_project_id") or "").strip()
 if project:
     print(project)
 PY
@@ -1701,10 +1701,6 @@ google_v2_ready_for_retry() {
 
 transcribe_with_google_v2() {
     require_cmd python3
-    if ! python3 -c 'import google.cloud.speech_v2' >/dev/null 2>&1; then
-        log "asr: google-v2 missing python deps (google-cloud-speech). Reinstall S2T."
-        return 1
-    fi
 
     local project
     project="$(resolve_gcp_project || true)"
@@ -1730,10 +1726,6 @@ transcribe_with_google_v2() {
 
     local recognizer_name="projects/${project}/locations/${location}/recognizers/${recognizer_id}"
 
-    # Run the v2 call via the official client (gRPC) so regional endpoints work.
-    # Endpoint defaults:
-    # - global: speech.googleapis.com
-    # - regional: ${location}-speech.googleapis.com
     local endpoint
     if [ "$location" = "global" ]; then
         endpoint="speech.googleapis.com"
@@ -1745,7 +1737,7 @@ transcribe_with_google_v2() {
     model="${S2T_GOOGLE_V2_MODEL}"
     langs="${S2T_GOOGLE_V2_LANGUAGE_CODES}"
 
-    GOOGLE_APPLICATION_CREDENTIALS="$S2T_GOOGLE_APPLICATION_CREDENTIALS" \
+    S2T_GOOGLE_APPLICATION_CREDENTIALS="$S2T_GOOGLE_APPLICATION_CREDENTIALS" \
     GOOGLE_CLOUD_PROJECT="$project" \
     S2T_GOOGLE_V2_ENDPOINT="$endpoint" \
     S2T_GOOGLE_V2_RECOGNIZER_NAME="$recognizer_name" \
@@ -1754,64 +1746,113 @@ transcribe_with_google_v2() {
     S2T_GOOGLE_V2_ENABLE_PUNCTUATION="$S2T_GOOGLE_V2_ENABLE_PUNCTUATION" \
     S2T_GOOGLE_V2_TIMEOUT_SEC="$S2T_GOOGLE_V2_TIMEOUT_SEC" \
     python3 - "$AUDIO_FILE" 2>>"$LOG_FILE" <<'PY'
-import os, sys
-from google.cloud.speech_v2 import SpeechClient
-from google.cloud.speech_v2.types import cloud_speech
-from google.api_core.client_options import ClientOptions
-from google.api_core import exceptions
+import base64
+import http.client
+import json
+import os
+import socket
+import sys
+import urllib.parse
+import urllib.request
 
 audio_path = sys.argv[1]
-with open(audio_path, "rb") as f:
-    content = f.read()
-
+creds_path = os.environ.get("S2T_GOOGLE_APPLICATION_CREDENTIALS", "").strip()
 endpoint = os.environ.get("S2T_GOOGLE_V2_ENDPOINT", "speech.googleapis.com")
 recognizer = os.environ["S2T_GOOGLE_V2_RECOGNIZER_NAME"]
 model = os.environ.get("S2T_GOOGLE_V2_MODEL", "chirp_2")
 langs = os.environ.get("S2T_GOOGLE_V2_LANGUAGE_CODES", "ru-RU,en-US")
 punct = os.environ.get("S2T_GOOGLE_V2_ENABLE_PUNCTUATION", "1") == "1"
+timeout_raw = os.environ.get("S2T_GOOGLE_V2_TIMEOUT_SEC", "0")
+
+try:
+    response_timeout = float(timeout_raw)
+except ValueError:
+    response_timeout = 0.0
+if response_timeout <= 0:
+    response_timeout = None
+
+with open(audio_path, "rb") as f:
+    content_b64 = base64.b64encode(f.read()).decode("ascii")
 
 language_codes = [x.strip() for x in langs.split(",") if x.strip()]
 
-client = SpeechClient(client_options=ClientOptions(api_endpoint=endpoint))
-
-config = cloud_speech.RecognitionConfig(
-    auto_decoding_config=cloud_speech.AutoDetectDecodingConfig(),
-    language_codes=language_codes,
-    model=model,
-    features=cloud_speech.RecognitionFeatures(enable_automatic_punctuation=punct),
-)
-
-req = cloud_speech.RecognizeRequest(
-    recognizer=recognizer,
-    config=config,
-    content=content,
-)
-
-timeout_raw = os.environ.get("S2T_GOOGLE_V2_TIMEOUT_SEC", "0")
-timeout = None
-try:
-    timeout_value = float(timeout_raw)
-    if timeout_value > 0:
-        timeout = timeout_value
-except ValueError:
-    timeout = None
+req = {
+    "config": {
+        "autoDecodingConfig": {},
+        "languageCodes": language_codes,
+        "model": model,
+        "features": {
+            "enableAutomaticPunctuation": punct
+        }
+    },
+    "content": content_b64
+}
+body = json.dumps(req, ensure_ascii=False).encode("utf-8")
 
 try:
-    if timeout is None:
-        resp = client.recognize(request=req)
-    else:
-        resp = client.recognize(request=req, timeout=timeout)
-except exceptions.GoogleAPICallError as e:
-    sys.stderr.write(f"google-v2 error: {e}\\n")
+    with open(creds_path) as f:
+        creds = json.load(f)
+    req_token = urllib.request.Request("https://oauth2.googleapis.com/token", data=urllib.parse.urlencode({
+        "client_id": creds["client_id"],
+        "client_secret": creds["client_secret"],
+        "refresh_token": creds["refresh_token"],
+        "grant_type": "refresh_token"
+    }).encode("utf-8"))
+    with urllib.request.urlopen(req_token) as resp_token:
+        token = json.loads(resp_token.read())["access_token"]
+except Exception as e:
+    sys.stderr.write(f"google-v2 failed to get token: {e}\n")
     raise SystemExit(1)
 
-parts = []
-for r in resp.results:
-    for alt in r.alternatives:
-        if getattr(alt, "transcript", ""):
-            parts.append(alt.transcript)
+host = endpoint
+path = f"/v2/{recognizer}:recognize"
 
-sys.stdout.write(" ".join(parts).strip())
+headers = {
+    "Content-Type": "application/json",
+    "Authorization": f"Bearer {token}",
+    "x-goog-user-project": creds.get("quota_project_id", "")
+}
+
+conn = http.client.HTTPSConnection(host, timeout=3.0)
+
+try:
+    conn.request("POST", path, body=body, headers=headers)
+    if response_timeout is not None and conn.sock is not None:
+        conn.sock.settimeout(response_timeout)
+    resp = conn.getresponse()
+    payload = resp.read().decode("utf-8", errors="replace")
+except socket.timeout:
+    sys.stderr.write("google-v2 response timeout\n")
+    raise SystemExit(124)
+except Exception as e:
+    sys.stderr.write(f"google-v2 request failed: {e}\n")
+    raise SystemExit(1)
+finally:
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+if not payload.strip():
+    raise SystemExit(0)
+
+try:
+    data = json.loads(payload)
+except json.JSONDecodeError:
+    sys.stderr.write("google-v2 returned invalid json\n")
+    raise SystemExit(1)
+
+error = data.get("error") or {}
+err_msg = error.get("message")
+if err_msg:
+    sys.stderr.write(f"google-v2 error: {err_msg}\n")
+    raise SystemExit(1)
+
+results = data.get("results", [])
+for result in results:
+    alts = result.get("alternatives", [])
+    if alts:
+        print(alts[0].get("transcript", ""))
 PY
 }
 

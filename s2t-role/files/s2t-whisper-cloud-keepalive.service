@@ -1,0 +1,28 @@
+[Unit]
+Description=S2T Whisper Cloud Keepalive (User)
+After=network-online.target
+Wants=network-online.target
+PartOf=s2t.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/s2t/s2t.env
+EnvironmentFile=-%h/.config/s2t/secrets.env
+EnvironmentFile=-%h/.config/s2t/s2t.env
+ExecCondition=/bin/bash -lc '[ "${S2T_ASR_PROVIDER:-}" = "gcp-l4" ]'
+ExecCondition=/bin/bash -lc '[ "${S2T_GCP_KEEPALIVE_ENABLED:-1}" = "1" ]'
+ExecCondition=/bin/bash -lc '[ -n "${S2T_GCP_WHISPER_URL:-}" ]'
+ExecStart=/etc/s2t/scripts/whisper_cloud_keepalive.sh
+Restart=always
+RestartSec=5
+CPUAccounting=yes
+MemoryAccounting=yes
+TasksAccounting=yes
+CPUQuota=20%
+CPUWeight=10
+MemoryMax=128M
+TasksMax=16
+
+[Install]
+WantedBy=default.target
+WantedBy=s2t.target
