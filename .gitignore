@@ -39,3 +39,10 @@ quarantine/
 raw/
 queue/
 pending/
+
+# Rust
+s2t-core-rust/target/
+s2t-core-rust/Cargo.lock
+
+# Envoy
+envoy/

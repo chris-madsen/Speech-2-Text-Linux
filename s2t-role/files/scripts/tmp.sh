@@ -2268,6 +2268,30 @@ google_v2_ready_for_retry() {
     return 0
 }
 
+encode_to_opus() {
+    local input="$1"
+    local output="$2"
+    local t_start t_end
+    
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        return 1
+    fi
+    
+    t_start="$(now_ms)"
+    # -y: overwrite
+    # -i: input
+    # -c:a libopus: use opus codec
+    # -b:a 24k: 24kbps is plenty for speech
+    # -v quiet: suppress output
+    ffmpeg -y -i "$input" -c:a libopus -b:a 24k -v quiet "$output" || return 1
+    t_end="$(now_ms)"
+    
+    if [ "$S2T_DEBUG_TIMING" = "1" ]; then
+        log "timing: opus_encode_ms=$((t_end - t_start))"
+    fi
+    return 0
+}
+
 transcribe_with_google_v2() {
     require_cmd python3
 
@@ -4325,6 +4349,30 @@ google_v2_ready_for_retry() {
     return 0
 }
 
+encode_to_opus() {
+    local input="$1"
+    local output="$2"
+    local t_start t_end
+    
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        return 1
+    fi
+    
+    t_start="$(now_ms)"
+    # -y: overwrite
+    # -i: input
+    # -c:a libopus: use opus codec
+    # -b:a 24k: 24kbps is plenty for speech
+    # -v quiet: suppress output
+    ffmpeg -y -i "$input" -c:a libopus -b:a 24k -v quiet "$output" || return 1
+    t_end="$(now_ms)"
+    
+    if [ "$S2T_DEBUG_TIMING" = "1" ]; then
+        log "timing: opus_encode_ms=$((t_end - t_start))"
+    fi
+    return 0
+}
+
 transcribe_with_google_v2() {
     require_cmd python3
     if ! python3 -c 'import google.cloud.speech_v2' >/dev/null 2>&1; then
@@ -4371,6 +4419,15 @@ transcribe_with_google_v2() {
     model="${S2T_GOOGLE_V2_MODEL}"
     langs="${S2T_GOOGLE_V2_LANGUAGE_CODES}"
 
+    local opus_file="${AUDIO_FILE%.wav}.ogg"
+    local audio_to_send="$AUDIO_FILE"
+    if encode_to_opus "$AUDIO_FILE" "$opus_file"; then
+        audio_to_send="$opus_file"
+        if [ "$S2T_DEBUG_TIMING" = "1" ]; then
+            log "asr: using opus compression ($(file_size_bytes "$opus_file") bytes)"
+        fi
+    fi
+
     GOOGLE_APPLICATION_CREDENTIALS="$S2T_GOOGLE_APPLICATION_CREDENTIALS" \
     GOOGLE_CLOUD_PROJECT="$project" \
     S2T_GOOGLE_V2_ENDPOINT="$endpoint" \
@@ -4379,7 +4436,15 @@ transcribe_with_google_v2() {
     S2T_GOOGLE_V2_LANGUAGE_CODES="$langs" \
     S2T_GOOGLE_V2_ENABLE_PUNCTUATION="$S2T_GOOGLE_V2_ENABLE_PUNCTUATION" \
     S2T_GOOGLE_V2_TIMEOUT_SEC="$S2T_GOOGLE_V2_TIMEOUT_SEC" \
-    python3 - "$AUDIO_FILE" 2>>"$LOG_FILE" <<'PY'
+    out_text="$(GOOGLE_APPLICATION_CREDENTIALS="$S2T_GOOGLE_APPLICATION_CREDENTIALS" \
+    GOOGLE_CLOUD_PROJECT="$project" \
+    S2T_GOOGLE_V2_ENDPOINT="$endpoint" \
+    S2T_GOOGLE_V2_RECOGNIZER_NAME="$recognizer_name" \
+    S2T_GOOGLE_V2_MODEL="$model" \
+    S2T_GOOGLE_V2_LANGUAGE_CODES="$langs" \
+    S2T_GOOGLE_V2_ENABLE_PUNCTUATION="$S2T_GOOGLE_V2_ENABLE_PUNCTUATION" \
+    S2T_GOOGLE_V2_TIMEOUT_SEC="$S2T_GOOGLE_V2_TIMEOUT_SEC" \
+    python3 - "$audio_to_send" 2>>"$LOG_FILE" <<'PY'
 import os, sys
 from google.cloud.speech_v2 import SpeechClient
 from google.cloud.speech_v2.types import cloud_speech
@@ -4428,7 +4493,7 @@ try:
     else:
         resp = client.recognize(request=req, timeout=timeout)
 except exceptions.GoogleAPICallError as e:
-    sys.stderr.write(f"google-v2 error: {e}\\n")
+    sys.stderr.write(f"google-v2 error: {e}\n")
     raise SystemExit(1)
 
 parts = []
@@ -4437,8 +4502,13 @@ for r in resp.results:
         if getattr(alt, "transcript", ""):
             parts.append(alt.transcript)
 
-sys.stdout.write(" ".join(parts).strip())
+out_text = " ".join(parts).strip()
+if not out_text:
+    sys.stderr.write(f"google-v2 returned empty result for audio {audio_path}\n")
+sys.stdout.write(out_text)
 PY
+)"
+    printf '%s' "$out_text"
 }
 
 stop_and_transcribe() {
@@ -5015,6 +5085,8 @@ stop_and_transcribe() {
         type_text "$TEXT" "$transcribe_id"
     else
         log "asr: normalized text empty"
+        # Clear secondary buffer to prevent stale paste
+        save_secondary_buffer_text "" "$transcribe_id" || true
     fi
 }
 
