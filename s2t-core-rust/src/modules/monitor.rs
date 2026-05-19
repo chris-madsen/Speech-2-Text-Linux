@@ -2,7 +2,6 @@ use anyhow::{Result, Context};
 use evdev::{Device, Key};
 use log::{info, debug, error};
 use tokio::sync::mpsc;
-use tokio_stream::StreamExt;
 
 pub enum HotkeyEvent {
     Pressed,

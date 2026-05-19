@@ -1,7 +1,7 @@
 PLAYBOOK_INSTALL := install.yml
 PLAYBOOK_UNINSTALL := uninstall.yml
 
-.PHONY: install clean remove uninstall test test-playbooks install-both uninstall-both dataset-build deploy-gcp-l4 install-gcp-l4-keepalive uninstall-gcp-l4-keepalive
+.PHONY: install clean remove uninstall test test-playbooks install-both uninstall-both dataset-build deploy-gcp-l4 install-gcp-l4-keepalive uninstall-gcp-l4-keepalive rust-deploy rust-logs
 
 VENV ?= .venv
 S2T_USER ?=
@@ -14,6 +14,8 @@ DATASET_SEED ?= 42
 PROJECT_ID ?=
 REGION ?= europe-north1
 SERVICE_NAME ?= whisper-l4
+RUST_BIN ?= /home/ilja/.local/bin/s2t-core-rust
+RUST_PKG_CONFIG_PATH ?= /usr/lib/x86_64-linux-gnu/pkgconfig
 
 ANSIBLE_PLAYBOOK := $(if $(wildcard $(VENV)/bin/ansible-playbook),$(abspath $(VENV))/bin/ansible-playbook,ansible-playbook)
 MOLECULE := $(if $(wildcard $(VENV)/bin/molecule),$(abspath $(VENV))/bin/molecule,molecule)
@@ -77,3 +79,14 @@ install-gcp-l4-keepalive:
 
 uninstall-gcp-l4-keepalive:
 	sudo ./whisper-l4/keepalive/uninstall_keepalive.sh
+
+rust-deploy:
+	@echo "Building and deploying Rust core only (no legacy service restarts)..."
+	cd s2t-core-rust && PKG_CONFIG_PATH="$(RUST_PKG_CONFIG_PATH)" cargo build --release
+	install -m 0755 s2t-core-rust/target/release/s2t-core-rust "$(RUST_BIN)"
+	systemctl --user restart s2t-rust.service
+	systemctl --user status s2t-rust.service --no-pager -n 20
+
+rust-logs:
+	@echo "Tailing Rust core log..."
+	tail -f /run/user/$$(id -u)/s2t/s2t.log
