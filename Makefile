@@ -137,8 +137,8 @@ rust-provider-local:
 		unset_kv() { key="$$1"; file="$(S2T_ENV_FILE)"; sed -i "/^$${key}=.*/d" "$$file"; }; \
 		set_kv S2T_ASR_PROVIDER local; \
 		set_kv S2T_MODEL_PATH /home/ilja/.local/share/s2t/ggml-small.bin; \
-		set_kv S2T_LANG ru; \
-		set_kv S2T_LOCAL_REQUEST_LANGUAGE ru; \
+		set_kv S2T_LANG auto; \
+		set_kv S2T_LOCAL_REQUEST_LANGUAGE auto; \
 		set_kv S2T_LOCAL_STREAMING 1; \
 		set_kv S2T_LOCAL_STREAM_BIN /etc/s2t/result/bin/whisper-stream; \
 		set_kv S2T_LOCAL_STREAM_STEP_MS 600; \

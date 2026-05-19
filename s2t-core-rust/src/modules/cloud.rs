@@ -538,40 +538,66 @@ impl LocalProvider {
         }
     }
     async fn transcribe_pcm_wav(&self, sample_rate: u32, pcm_bytes: Vec<u8>) -> Result<String> {
+        self.transcribe_pcm_wav_with_lang(sample_rate, pcm_bytes, None)
+            .await
+    }
+
+    async fn transcribe_pcm_wav_with_lang(
+        &self,
+        sample_rate: u32,
+        pcm_bytes: Vec<u8>,
+        lang_override: Option<&str>,
+    ) -> Result<String> {
         if pcm_bytes.is_empty() {
             return Ok(String::new());
         }
+        let prep_started = Instant::now();
+        let target_rate = 16_000u32;
+
+        let in_samples = pcm_bytes.len() / 2;
+        let normalized_i16 = Self::resample_mono_s16le(&pcm_bytes, sample_rate, target_rate);
+        let out_samples = normalized_i16.len();
+
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
             let spec = hound::WavSpec {
                 channels: 1,
-                sample_rate,
+                sample_rate: target_rate,
                 bits_per_sample: 16,
                 sample_format: hound::SampleFormat::Int,
             };
             let mut writer =
                 hound::WavWriter::new(&mut cursor, spec).context("failed to create WAV encoder")?;
-
-            for sample in pcm_bytes.chunks_exact(2) {
-                let s = i16::from_le_bytes([sample[0], sample[1]]);
-                writer
-                    .write_sample(s)
-                    .context("failed to write WAV sample")?;
+            for s in normalized_i16 {
+                writer.write_sample(s).context("failed to write WAV sample")?;
             }
             writer.finalize().context("failed to finalize WAV")?;
         }
 
         let wav_bytes = cursor.into_inner();
+        debug!(
+            "local wav prep: in_rate={} -> out_rate={}, in_samples={}, out_samples={}, wav_bytes={}, prep_ms={}",
+            sample_rate,
+            target_rate,
+            in_samples,
+            out_samples,
+            wav_bytes.len(),
+            prep_started.elapsed().as_millis()
+        );
         let part = reqwest::multipart::Part::bytes(wav_bytes)
             .file_name("audio.wav")
             .mime_str("audio/wav")?;
         let mut form = reqwest::multipart::Form::new().part("file", part);
-        if let Some(lang) = &self.cfg.request_language {
+        let lang_to_use = lang_override
+            .map(|v| v.to_string())
+            .or_else(|| self.cfg.request_language.clone());
+        if let Some(lang) = &lang_to_use {
             if !lang.is_empty() {
                 form = form.text("language", lang.clone());
             }
         }
 
+        let request_started = Instant::now();
         let response = self
             .http
             .post(&self.cfg.whisper_server_url)
@@ -582,6 +608,12 @@ impl LocalProvider {
 
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
+        debug!(
+            "local whisper request done: status={}, roundtrip_ms={}, body_len={}",
+            status,
+            request_started.elapsed().as_millis(),
+            body.len()
+        );
         if !status.is_success() {
             return Err(anyhow!(
                 "local whisper-server returned {}: {}",
@@ -600,6 +632,58 @@ impl LocalProvider {
             .to_string();
 
         Ok(text)
+    }
+
+    fn infer_lang_from_text(text: &str) -> Option<String> {
+        let mut cyr = 0usize;
+        let mut lat = 0usize;
+        for ch in text.chars() {
+            if ('\u{0400}'..='\u{04FF}').contains(&ch) {
+                cyr += 1;
+            } else if ch.is_ascii_alphabetic() {
+                lat += 1;
+            }
+        }
+        if cyr >= 3 && cyr >= lat {
+            Some("ru".to_string())
+        } else if lat >= 3 {
+            Some("en".to_string())
+        } else {
+            None
+        }
+    }
+
+    fn resample_mono_s16le(input_pcm: &[u8], in_rate: u32, out_rate: u32) -> Vec<i16> {
+        if input_pcm.is_empty() {
+            return Vec::new();
+        }
+        let in_rate = in_rate.max(1);
+        let out_rate = out_rate.max(1);
+
+        let mut in_samples = Vec::with_capacity(input_pcm.len() / 2);
+        for sample in input_pcm.chunks_exact(2) {
+            in_samples.push(i16::from_le_bytes([sample[0], sample[1]]));
+        }
+        if in_samples.is_empty() {
+            return Vec::new();
+        }
+        if in_rate == out_rate {
+            return in_samples;
+        }
+
+        let out_len =
+            ((in_samples.len() as u64).saturating_mul(out_rate as u64) / in_rate as u64) as usize;
+        if out_len == 0 {
+            return vec![in_samples[0]];
+        }
+
+        let mut out = Vec::with_capacity(out_len);
+        for j in 0..out_len {
+            let src_idx = ((j as u64).saturating_mul(in_rate as u64) / out_rate as u64) as usize;
+            let idx = src_idx.min(in_samples.len().saturating_sub(1));
+            out.push(in_samples[idx]);
+        }
+        out
     }
 
     fn strip_ansi(input: &str) -> String {
@@ -861,7 +945,7 @@ impl LocalProvider {
 
     fn min_snapshot_start_ms(total_audio_ms: u64) -> u64 {
         if total_audio_ms < 4_000 {
-            600
+            900
         } else if total_audio_ms < 10_000 {
             900
         } else if total_audio_ms < 15_000 {
@@ -891,6 +975,21 @@ impl LocalProvider {
         trimmed.chars().count() + words * 12
     }
 
+    fn looks_sentence_complete(text: &str) -> bool {
+        let t = text.trim_end();
+        if t.is_empty() {
+            return false;
+        }
+        match t.chars().last() {
+            Some('.') | Some('!') | Some('?') | Some('…') => true,
+            Some('"') | Some('»') | Some('\'') => {
+                let base = t.trim_end_matches(['"', '»', '\'']);
+                matches!(base.chars().last(), Some('.') | Some('!') | Some('?') | Some('…'))
+            }
+            _ => false,
+        }
+    }
+
     fn update_best_text(raw: &str, best_text: &mut String, best_score: &mut usize) {
         let candidate = Self::extract_whisper_stream_text(raw);
         let score = Self::text_score(&candidate);
@@ -907,6 +1006,7 @@ impl LocalProvider {
         }
         let words = Self::text_word_count(trimmed);
         let chars = trimmed.chars().count();
+        let complete = Self::looks_sentence_complete(trimmed);
 
         if best_audio_ms.saturating_add(500) < total_audio_ms {
             let coverage = if total_audio_ms == 0 {
@@ -914,8 +1014,14 @@ impl LocalProvider {
             } else {
                 best_audio_ms as f64 / total_audio_ms as f64
             };
-            // For short utterances, accept near-complete stream result to avoid slow full-pass.
-            if !(coverage >= 0.72 && chars >= 35 && words >= 6) {
+            let tail_gap_ms = total_audio_ms.saturating_sub(best_audio_ms);
+            // Avoid cutting off last words: if the tail gap is noticeable and sentence
+            // does not look complete, prefer full pass.
+            if tail_gap_ms > 260 && !complete {
+                return true;
+            }
+            // For short utterances, accept stream result only when coverage is high enough.
+            if !(coverage >= 0.85 && chars >= 35 && words >= 6) {
                 return true;
             }
         }
@@ -991,6 +1097,13 @@ impl TranscribeProvider for LocalProvider {
         let mut best_stream_text = String::new();
         let mut best_stream_score = 0usize;
         let mut best_stream_audio_ms = 0u64;
+        let auto_mode = self
+            .cfg
+            .request_language
+            .as_deref()
+            .map(|v| v.eq_ignore_ascii_case("auto"))
+            .unwrap_or(false);
+        let mut detected_lang: Option<String> = None;
 
         while let Some(chunk) = audio_rx.recv().await {
             if chunk.is_empty() {
@@ -1006,6 +1119,12 @@ impl TranscribeProvider for LocalProvider {
                     }
                     match handle.await {
                         Ok(Ok(text)) if !text.trim().is_empty() => {
+                            if auto_mode && detected_lang.is_none() {
+                                detected_lang = Self::infer_lang_from_text(&text);
+                                if let Some(lang) = &detected_lang {
+                                    debug!("local auto-lang locked to '{}'", lang);
+                                }
+                            }
                             let score = Self::text_score(&text);
                             let covered_ms = inflight_snapshot_audio_ms.unwrap_or(0);
                             if covered_ms >= best_stream_audio_ms || score >= best_stream_score {
@@ -1036,6 +1155,7 @@ impl TranscribeProvider for LocalProvider {
                 bytes_since_snapshot = 0;
                 let snapshot = pcm_bytes.clone();
                 let provider = self.clone_for_task();
+                let lang_hint = detected_lang.clone();
                 snapshot_started_at = Some(Instant::now());
                 inflight_snapshot_audio_ms = Some(total_audio_ms);
                 debug!(
@@ -1044,7 +1164,9 @@ impl TranscribeProvider for LocalProvider {
                     snapshot.len()
                 );
                 snapshot_task = Some(tokio::spawn(async move {
-                    provider.transcribe_pcm_wav(sample_rate, snapshot).await
+                    provider
+                        .transcribe_pcm_wav_with_lang(sample_rate, snapshot, lang_hint.as_deref())
+                        .await
                 }));
             }
 
@@ -1064,6 +1186,12 @@ impl TranscribeProvider for LocalProvider {
                 }
                 match handle.await {
                     Ok(Ok(text)) if !text.trim().is_empty() => {
+                        if auto_mode && detected_lang.is_none() {
+                            detected_lang = Self::infer_lang_from_text(&text);
+                            if let Some(lang) = &detected_lang {
+                                debug!("local auto-lang locked to '{}'", lang);
+                            }
+                        }
                         let score = Self::text_score(&text);
                         let covered_ms = inflight_snapshot_audio_ms.unwrap_or(0);
                         if covered_ms >= best_stream_audio_ms || score >= best_stream_score {
@@ -1079,20 +1207,28 @@ impl TranscribeProvider for LocalProvider {
             } else if best_stream_score > 0 {
                 let final_audio_ms = (pcm_bytes.len() / bytes_per_ms) as u64;
                 let inflight_audio_ms = inflight_snapshot_audio_ms.unwrap_or(final_audio_ms);
-                let snapshot_covers_all_audio = inflight_audio_ms.saturating_add(320) >= final_audio_ms;
+                let snapshot_covers_all_audio =
+                    inflight_audio_ms.saturating_add(900) >= final_audio_ms;
                 if snapshot_covers_all_audio {
                     let wait_ms = Self::release_wait_timeout_ms(inflight_audio_ms);
                     debug!(
                         "local: waiting in-flight full snapshot after release (wait_ms={}, inflight_audio_ms={}, final_audio_ms={})",
                         wait_ms, inflight_audio_ms, final_audio_ms
                     );
-                    match timeout(Duration::from_millis(wait_ms), handle).await {
+                    let mut handle = handle;
+                    match timeout(Duration::from_millis(wait_ms), &mut handle).await {
                         Ok(joined) => {
                             if let Some(started) = snapshot_started_at.take() {
                                 last_snapshot_latency_ms = Some(started.elapsed().as_millis() as u64);
                             }
                             match joined {
                                 Ok(Ok(text)) if !text.trim().is_empty() => {
+                                    if auto_mode && detected_lang.is_none() {
+                                        detected_lang = Self::infer_lang_from_text(&text);
+                                        if let Some(lang) = &detected_lang {
+                                            debug!("local auto-lang locked to '{}'", lang);
+                                        }
+                                    }
                                     let score = Self::text_score(&text);
                                     let covered_ms = inflight_snapshot_audio_ms.unwrap_or(0);
                                     if covered_ms >= best_stream_audio_ms || score >= best_stream_score {
@@ -1107,6 +1243,7 @@ impl TranscribeProvider for LocalProvider {
                             }
                         }
                         Err(_) => {
+                            handle.abort();
                             debug!(
                                 "local: timed out waiting full in-flight snapshot after release, will fallback"
                             );
@@ -1127,13 +1264,20 @@ impl TranscribeProvider for LocalProvider {
                     "local: waiting in-flight first snapshot after release (wait_ms={}, inflight_audio_ms={}, final_audio_ms={})",
                     wait_ms, inflight_audio_ms, final_audio_ms
                 );
-                match timeout(Duration::from_millis(wait_ms), handle).await {
+                let mut handle = handle;
+                match timeout(Duration::from_millis(wait_ms), &mut handle).await {
                     Ok(joined) => {
                         if let Some(started) = snapshot_started_at.take() {
                             last_snapshot_latency_ms = Some(started.elapsed().as_millis() as u64);
                         }
                         match joined {
                             Ok(Ok(text)) if !text.trim().is_empty() => {
+                                if auto_mode && detected_lang.is_none() {
+                                    detected_lang = Self::infer_lang_from_text(&text);
+                                    if let Some(lang) = &detected_lang {
+                                        debug!("local auto-lang locked to '{}'", lang);
+                                    }
+                                }
                                 let score = Self::text_score(&text);
                                 let covered_ms = inflight_snapshot_audio_ms.unwrap_or(0);
                                 if covered_ms >= best_stream_audio_ms || score >= best_stream_score {
@@ -1148,6 +1292,7 @@ impl TranscribeProvider for LocalProvider {
                         }
                     }
                     Err(_) => {
+                        handle.abort();
                         debug!("local: timed out waiting first in-flight snapshot after release");
                     }
                 }
@@ -1176,7 +1321,9 @@ impl TranscribeProvider for LocalProvider {
             pcm_bytes.len()
         );
         let full_start = Instant::now();
-        let final_text = self.transcribe_pcm_wav(sample_rate, pcm_bytes).await?;
+        let final_text = self
+            .transcribe_pcm_wav_with_lang(sample_rate, pcm_bytes, detected_lang.as_deref())
+            .await?;
         debug!(
             "local: full pass finished in {} ms, chars={}",
             full_start.elapsed().as_millis(),
