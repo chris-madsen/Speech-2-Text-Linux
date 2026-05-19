@@ -35,7 +35,6 @@
               ydotool
               sox
               ffmpeg
-              xdotool
               (python3.withPackages (p: [ p.evdev p.google-cloud-speech p.pika ]))
             ];
 

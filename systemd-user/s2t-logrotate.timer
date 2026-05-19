@@ -1,0 +1,11 @@
+[Unit]
+Description=Run S2T log rotation every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=s2t-logrotate.service
+
+[Install]
+WantedBy=timers.target

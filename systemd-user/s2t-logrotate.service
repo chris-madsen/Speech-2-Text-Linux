@@ -1,0 +1,7 @@
+[Unit]
+Description=S2T runtime log rotation
+
+[Service]
+Type=oneshot
+Environment=S2T_LOG_FILE=/run/user/%U/s2t/s2t.log
+ExecStart=%h/.local/bin/s2t-logrotate.sh

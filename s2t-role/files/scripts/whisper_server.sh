@@ -93,9 +93,16 @@ elif [ "$THREADS_DEFAULT" -gt 4 ]; then
   THREADS_DEFAULT=4
 fi
 THREADS="${S2T_THREADS:-$THREADS_DEFAULT}"
-BEAM_SIZE="${S2T_BEAM_SIZE:-1}"
+BEAM_SIZE="${S2T_BEAM_SIZE:--1}"
 BEST_OF="${S2T_BEST_OF:-1}"
 NO_SPEECH_THOLD="${S2T_NO_SPEECH_THOLD:-0.6}"
+NO_FALLBACK="${S2T_NO_FALLBACK:-1}"
+
+NO_FALLBACK_FLAG=""
+case "${NO_FALLBACK,,}" in
+  1|true|yes|on) NO_FALLBACK_FLAG="-nf" ;;
+  *) NO_FALLBACK_FLAG="" ;;
+esac
 
 exec /etc/s2t/result/bin/whisper-server \
   --host 127.0.0.1 \
@@ -105,5 +112,6 @@ exec /etc/s2t/result/bin/whisper-server \
   -t "$THREADS" \
   -bs "$BEAM_SIZE" \
   -bo "$BEST_OF" \
+  $NO_FALLBACK_FLAG \
   -nth "$NO_SPEECH_THOLD" \
   -nt
