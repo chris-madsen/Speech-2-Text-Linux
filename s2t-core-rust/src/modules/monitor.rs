@@ -35,6 +35,12 @@ pub async fn run(tx: mpsc::Sender<HotkeyEvent>) -> Result<()> {
                     }
                     _ => {}
                 },
+                Key::KEY_F23 => {
+                    if event.value() == 1 {
+                        debug!("Manual paste hotkey pressed (F23 / Alt+V)");
+                        let _ = tx.send(HotkeyEvent::ManualPaste).await;
+                    }
+                }
                 _ => {}
             }
         }

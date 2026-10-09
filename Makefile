@@ -87,6 +87,10 @@ rust-deploy:
 	@echo "Building and deploying Rust core only (no legacy service restarts)..."
 	cd s2t-core-rust && PKG_CONFIG_PATH="$(RUST_PKG_CONFIG_PATH)" cargo build --release
 	install -m 0755 s2t-core-rust/target/release/s2t-core-rust "$(RUST_BIN)"
+	mkdir -p "$(HOME)/.config/autostart"
+	install -m 0644 s2t-role/files/s2t-env-import.desktop "$(HOME)/.config/autostart/s2t-env-import.desktop"
+	systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_SESSION_TYPE DBUS_SESSION_BUS_ADDRESS || true
+	dbus-update-activation-environment --systemd DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_SESSION_TYPE DBUS_SESSION_BUS_ADDRESS >/dev/null 2>&1 || true
 	systemctl --user restart s2t-rust.service
 	systemctl --user status s2t-rust.service --no-pager -n 20
 

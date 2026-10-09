@@ -64,6 +64,12 @@ impl ProviderKind {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptionEvent {
+    Partial(String),
+    Final(String),
+}
+
 #[async_trait]
 pub trait TranscribeProvider: Send + Sync {
     fn kind(&self) -> ProviderKind;
@@ -76,6 +82,7 @@ pub trait TranscribeProvider: Send + Sync {
         audio_rx: mpsc::Receiver<Vec<u8>>,
         sample_rate: u32,
         is_streaming: Arc<AtomicBool>,
+        updates_tx: mpsc::UnboundedSender<TranscriptionEvent>,
     ) -> Result<String>;
 }
 
@@ -165,7 +172,9 @@ impl RuntimeConfig {
         let provider = ProviderKind::parse(&provider_raw)?;
 
         let google_project_default = "poetic-emblem-494722-v2".to_string();
-        let google_project = match env_var("S2T_GCP_PROJECT").or_else(|| env_var("GOOGLE_CLOUD_PROJECT")) {
+        let google_project = match env_var("S2T_GCP_PROJECT")
+            .or_else(|| env_var("GOOGLE_CLOUD_PROJECT"))
+        {
             Some(v) => v,
             None => {
                 if provider == ProviderKind::Google {
@@ -191,6 +200,10 @@ impl RuntimeConfig {
                 .unwrap_or_else(|| "http://127.0.0.1:50051".to_string()),
         };
 
+        let local_streaming_requested = env_var("S2T_LOCAL_STREAMING")
+            .map(|v| parse_bool(&v, true))
+            .unwrap_or(true);
+
         let local = LocalConfig {
             whisper_server_url: env_var("S2T_WHISPER_SERVER_URL")
                 .unwrap_or_else(|| "http://127.0.0.1:9788/inference".to_string()),
@@ -198,9 +211,7 @@ impl RuntimeConfig {
                 .or_else(|| env_var("S2T_LANG"))
                 .map(|v| normalize_whisper_lang(&v))
                 .filter(|v| !v.is_empty()),
-            streaming_enabled: env_var("S2T_LOCAL_STREAMING")
-                .map(|v| parse_bool(&v, true))
-                .unwrap_or(true),
+            streaming_enabled: local_streaming_requested,
             stream_bin: env_var("S2T_LOCAL_STREAM_BIN")
                 .unwrap_or_else(|| "/etc/s2t/result/bin/whisper-stream".to_string()),
             model_path: env_var("S2T_MODEL_PATH").unwrap_or_else(|| {
@@ -320,6 +331,47 @@ fn normalize_whisper_lang(raw: &str) -> String {
     }
 }
 
+fn join_transcript_parts(prefix: &str, suffix: &str) -> String {
+    let prefix = prefix.trim();
+    let suffix = suffix.trim();
+    match (prefix.is_empty(), suffix.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => prefix.to_string(),
+        (true, false) => suffix.to_string(),
+        (false, false) => format!("{prefix} {suffix}"),
+    }
+}
+
+fn send_partial_update(
+    updates_tx: &mpsc::UnboundedSender<TranscriptionEvent>,
+    last_sent_partial: &mut String,
+    text: impl Into<String>,
+) {
+    let text = text.into();
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == last_sent_partial {
+        return;
+    }
+    let normalized = trimmed.to_string();
+    *last_sent_partial = normalized.clone();
+    let _ = updates_tx.send(TranscriptionEvent::Partial(normalized));
+}
+
+fn send_final_update(
+    updates_tx: &mpsc::UnboundedSender<TranscriptionEvent>,
+    last_sent_partial: &mut String,
+    text: impl Into<String>,
+) {
+    let text = text.into();
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let normalized = trimmed.to_string();
+    *last_sent_partial = normalized.clone();
+    let _ = updates_tx.send(TranscriptionEvent::Final(normalized));
+}
+
 pub fn build_provider(config: &RuntimeConfig) -> Result<Arc<dyn TranscribeProvider>> {
     let provider: Arc<dyn TranscribeProvider> = match config.provider {
         ProviderKind::Google => Arc::new(GoogleProvider::new(config.google.clone())),
@@ -366,6 +418,7 @@ impl TranscribeProvider for GoogleProvider {
         mut audio_rx: mpsc::Receiver<Vec<u8>>,
         sample_rate: u32,
         is_streaming: Arc<AtomicBool>,
+        updates_tx: mpsc::UnboundedSender<TranscriptionEvent>,
     ) -> Result<String> {
         let token = self.get_access_token()?;
         info!(
@@ -422,6 +475,18 @@ impl TranscribeProvider for GoogleProvider {
         let mut stdout = ffmpeg.stdout.take().unwrap();
 
         tokio::spawn(async move {
+            // Pre-fill: send 600 ms of silence so the Opus encoder and gRPC
+            // stream are fully initialised before real speech arrives.
+            // This prevents the first word from being clipped due to
+            // TLS/HTTP-2 + gRPC setup latency (~300-500 ms).
+            let silence_samples = (sample_rate as usize * 600 / 1000) * 2; // 16-bit mono
+            let silence = vec![0u8; silence_samples];
+            if stdin.write_all(&silence).await.is_err() {
+                debug!("ffmpeg stdin silence pre-fill write error");
+                drop(stdin);
+                return;
+            }
+            debug!("google feeder: sent 600 ms silence pre-fill");
             while let Some(chunk) = audio_rx.recv().await {
                 if stdin.write_all(&chunk).await.is_err() {
                     debug!("ffmpeg stdin write error, breaking");
@@ -494,6 +559,7 @@ impl TranscribeProvider for GoogleProvider {
         let mut inbound = response.into_inner();
 
         let mut final_transcript = String::new();
+        let mut last_sent_partial = String::new();
         let start_wait = std::time::Instant::now();
         while let Some(resp) = inbound.message().await? {
             if let Some(results) = resp.results.first() {
@@ -506,11 +572,21 @@ impl TranscribeProvider for GoogleProvider {
                         );
                         final_transcript.push_str(&alt.transcript);
                         final_transcript.push(' ');
+                        send_partial_update(
+                            &updates_tx,
+                            &mut last_sent_partial,
+                            final_transcript.trim().to_string(),
+                        );
                     } else {
                         debug!(
                             "Interim result after {:?}: {}",
                             start_wait.elapsed(),
                             alt.transcript
+                        );
+                        send_partial_update(
+                            &updates_tx,
+                            &mut last_sent_partial,
+                            join_transcript_parts(&final_transcript, &alt.transcript),
                         );
                     }
                 }
@@ -520,14 +596,21 @@ impl TranscribeProvider for GoogleProvider {
             "Google Cloud stream closed after {:?}",
             start_wait.elapsed()
         );
-
-        Ok(final_transcript.trim().to_string())
+        let final_text = final_transcript.trim().to_string();
+        send_final_update(&updates_tx, &mut last_sent_partial, final_text.clone());
+        Ok(final_text)
     }
 }
 
 pub struct LocalProvider {
     cfg: LocalConfig,
     http: reqwest::Client,
+}
+
+#[derive(Debug, Clone)]
+struct LocalTranscription {
+    text: String,
+    detected_language: Option<String>,
 }
 
 impl LocalProvider {
@@ -542,14 +625,17 @@ impl LocalProvider {
             .await
     }
 
-    async fn transcribe_pcm_wav_with_lang(
+    async fn transcribe_pcm_wav_result_with_lang(
         &self,
         sample_rate: u32,
         pcm_bytes: Vec<u8>,
         lang_override: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<LocalTranscription> {
         if pcm_bytes.is_empty() {
-            return Ok(String::new());
+            return Ok(LocalTranscription {
+                text: String::new(),
+                detected_language: None,
+            });
         }
         let prep_started = Instant::now();
         let target_rate = 16_000u32;
@@ -569,7 +655,9 @@ impl LocalProvider {
             let mut writer =
                 hound::WavWriter::new(&mut cursor, spec).context("failed to create WAV encoder")?;
             for s in normalized_i16 {
-                writer.write_sample(s).context("failed to write WAV sample")?;
+                writer
+                    .write_sample(s)
+                    .context("failed to write WAV sample")?;
             }
             writer.finalize().context("failed to finalize WAV")?;
         }
@@ -588,13 +676,14 @@ impl LocalProvider {
             .file_name("audio.wav")
             .mime_str("audio/wav")?;
         let mut form = reqwest::multipart::Form::new().part("file", part);
-        let lang_to_use = lang_override
-            .map(|v| v.to_string())
-            .or_else(|| self.cfg.request_language.clone());
+        let lang_to_use = Self::normalize_request_language_param(
+            lang_override
+                .map(|v| v.to_string())
+                .or_else(|| self.cfg.request_language.clone())
+                .as_deref(),
+        );
         if let Some(lang) = &lang_to_use {
-            if !lang.is_empty() {
-                form = form.text("language", lang.clone());
-            }
+            form = form.text("language", lang.clone());
         }
 
         let request_started = Instant::now();
@@ -609,10 +698,11 @@ impl LocalProvider {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         debug!(
-            "local whisper request done: status={}, roundtrip_ms={}, body_len={}",
+            "local whisper request done: status={}, roundtrip_ms={}, body_len={}, lang_hint={:?}",
             status,
             request_started.elapsed().as_millis(),
-            body.len()
+            body.len(),
+            lang_to_use
         );
         if !status.is_success() {
             return Err(anyhow!(
@@ -630,8 +720,24 @@ impl LocalProvider {
             .unwrap_or("")
             .trim()
             .to_string();
+        let detected_language =
+            Self::extract_response_language(&parsed).or_else(|| Self::infer_lang_from_text(&text));
 
-        Ok(text)
+        Ok(LocalTranscription {
+            text,
+            detected_language,
+        })
+    }
+
+    async fn transcribe_pcm_wav_with_lang(
+        &self,
+        sample_rate: u32,
+        pcm_bytes: Vec<u8>,
+        lang_override: Option<&str>,
+    ) -> Result<String> {
+        self.transcribe_pcm_wav_result_with_lang(sample_rate, pcm_bytes, lang_override)
+            .await
+            .map(|result| result.text)
     }
 
     fn infer_lang_from_text(text: &str) -> Option<String> {
@@ -650,6 +756,54 @@ impl LocalProvider {
             Some("en".to_string())
         } else {
             None
+        }
+    }
+
+    fn normalize_request_language_param(raw: Option<&str>) -> Option<String> {
+        let raw = raw?;
+        let normalized = normalize_whisper_lang(raw);
+        if normalized.is_empty() || normalized.eq_ignore_ascii_case("auto") {
+            None
+        } else {
+            Some(normalized)
+        }
+    }
+
+    fn extract_response_language(parsed: &Value) -> Option<String> {
+        let candidates = [
+            parsed.get("language"),
+            parsed.get("result").and_then(|v| v.get("language")),
+            parsed
+                .get("result")
+                .and_then(|v| v.get("whisper"))
+                .and_then(|v| v.get("language")),
+            parsed.get("whisper").and_then(|v| v.get("language")),
+        ];
+        for candidate in candidates.into_iter().flatten() {
+            if let Some(raw) = candidate.as_str() {
+                let normalized = normalize_whisper_lang(raw);
+                if !normalized.is_empty() && !normalized.eq_ignore_ascii_case("auto") {
+                    return Some(normalized);
+                }
+            }
+        }
+        None
+    }
+
+    fn update_detected_lang(
+        auto_mode: bool,
+        detected_lang: &mut Option<String>,
+        result: &LocalTranscription,
+    ) {
+        if !auto_mode || detected_lang.is_some() {
+            return;
+        }
+        *detected_lang = result
+            .detected_language
+            .clone()
+            .or_else(|| Self::infer_lang_from_text(&result.text));
+        if let Some(lang) = detected_lang.as_deref() {
+            debug!("local auto-lang locked to '{}'", lang);
         }
     }
 
@@ -719,6 +873,9 @@ impl LocalProvider {
             let lower = t.to_ascii_lowercase();
             if t.starts_with("main:")
                 || t.starts_with("init:")
+                || t.starts_with("ALSA lib ")
+                || t.contains("snd_pcm_")
+                || t.contains("[error")
                 || t.starts_with("whisper_")
                 || t.starts_with("ggml_")
                 || t.starts_with("load_backend:")
@@ -754,7 +911,11 @@ impl LocalProvider {
         }
     }
 
-    async fn transcribe_true_stream(&self, is_streaming: Arc<AtomicBool>) -> Result<String> {
+    async fn transcribe_true_stream(
+        &self,
+        is_streaming: Arc<AtomicBool>,
+        updates_tx: &mpsc::UnboundedSender<TranscriptionEvent>,
+    ) -> Result<String> {
         let stream_bin = PathBuf::from(&self.cfg.stream_bin);
         if !stream_bin.exists() {
             return Err(anyhow!(
@@ -778,25 +939,25 @@ impl LocalProvider {
 
         let mut cmd = tokio::process::Command::new(&self.cfg.stream_bin);
         cmd.env("GGML_CUDA_FORCE_MMQ", "1");
-        cmd.env("SDL_AUDIODRIVER", "alsa");
+        cmd.env("SDL_AUDIODRIVER", "pulseaudio");
         cmd.args([
-                "-m",
-                &self.cfg.model_path,
-                "-l",
-                &lang,
-                "-t",
-                &self.cfg.threads.to_string(),
-                "--step",
-                &self.cfg.stream_step_ms.to_string(),
-                "--length",
-                &self.cfg.stream_length_ms.to_string(),
-                "--keep",
-                &self.cfg.stream_keep_ms.to_string(),
-                "-bs",
-                "-1",
-                "-nf",
-                "-fa",
-            ]);
+            "-m",
+            &self.cfg.model_path,
+            "-l",
+            &lang,
+            "-t",
+            &self.cfg.threads.to_string(),
+            "--step",
+            &self.cfg.stream_step_ms.to_string(),
+            "--length",
+            &self.cfg.stream_length_ms.to_string(),
+            "--keep",
+            &self.cfg.stream_keep_ms.to_string(),
+            "-bs",
+            "-1",
+            "-nf",
+            "-fa",
+        ]);
         if let Some(cid) = self.cfg.stream_capture_id {
             cmd.args(["-c", &cid.to_string()]);
         }
@@ -809,8 +970,14 @@ impl LocalProvider {
             .spawn()
             .context("failed to start whisper-stream")?;
 
-        let mut stdout = child.stdout.take().context("no stdout from whisper-stream")?;
-        let mut stderr = child.stderr.take().context("no stderr from whisper-stream")?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .context("no stdout from whisper-stream")?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .context("no stderr from whisper-stream")?;
 
         let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let tx_out = chunk_tx.clone();
@@ -844,11 +1011,15 @@ impl LocalProvider {
         let mut raw_output = String::new();
         let mut best_text = String::new();
         let mut best_score = 0usize;
+        let mut last_sent_partial = String::new();
 
         while is_streaming.load(Ordering::SeqCst) {
             while let Ok(chunk) = chunk_rx.try_recv() {
                 raw_output.push_str(&chunk);
                 Self::update_best_text(&raw_output, &mut best_text, &mut best_score);
+                if !best_text.trim().is_empty() {
+                    send_partial_update(updates_tx, &mut last_sent_partial, best_text.clone());
+                }
             }
             if let Some(_status) = child.try_wait()? {
                 break;
@@ -872,6 +1043,9 @@ impl LocalProvider {
             while let Ok(chunk) = chunk_rx.try_recv() {
                 raw_output.push_str(&chunk);
                 Self::update_best_text(&raw_output, &mut best_text, &mut best_score);
+                if !best_text.trim().is_empty() {
+                    send_partial_update(updates_tx, &mut last_sent_partial, best_text.clone());
+                }
             }
             if child.try_wait()?.is_some() {
                 break;
@@ -881,7 +1055,10 @@ impl LocalProvider {
 
         if child.try_wait()?.is_none() {
             let _ = child.start_kill();
-            if timeout(Duration::from_millis(700), child.wait()).await.is_err() {
+            if timeout(Duration::from_millis(700), child.wait())
+                .await
+                .is_err()
+            {
                 let _ = child.kill().await;
                 let _ = timeout(Duration::from_millis(300), child.wait()).await;
             }
@@ -892,6 +1069,9 @@ impl LocalProvider {
         while let Ok(chunk) = chunk_rx.try_recv() {
             raw_output.push_str(&chunk);
             Self::update_best_text(&raw_output, &mut best_text, &mut best_score);
+            if !best_text.trim().is_empty() {
+                send_partial_update(updates_tx, &mut last_sent_partial, best_text.clone());
+            }
         }
 
         let text = if best_text.trim().is_empty() {
@@ -925,9 +1105,9 @@ impl LocalProvider {
 
     fn adaptive_step_ms(total_audio_ms: u64, last_snapshot_ms: Option<u64>) -> u64 {
         let mut step = if total_audio_ms < 2_500 {
-            450
+            650
         } else if total_audio_ms < 8_000 {
-            700
+            900
         } else if total_audio_ms < 20_000 {
             1_200
         } else {
@@ -945,9 +1125,9 @@ impl LocalProvider {
 
     fn min_snapshot_start_ms(total_audio_ms: u64) -> u64 {
         if total_audio_ms < 4_000 {
-            900
+            4_000
         } else if total_audio_ms < 10_000 {
-            900
+            1_200
         } else if total_audio_ms < 15_000 {
             1_200
         } else if total_audio_ms < 18_000 {
@@ -984,7 +1164,10 @@ impl LocalProvider {
             Some('.') | Some('!') | Some('?') | Some('…') => true,
             Some('"') | Some('»') | Some('\'') => {
                 let base = t.trim_end_matches(['"', '»', '\'']);
-                matches!(base.chars().last(), Some('.') | Some('!') | Some('?') | Some('…'))
+                matches!(
+                    base.chars().last(),
+                    Some('.') | Some('!') | Some('?') | Some('…')
+                )
             }
             _ => false,
         }
@@ -1007,13 +1190,26 @@ impl LocalProvider {
         let words = Self::text_word_count(trimmed);
         let chars = trimmed.chars().count();
         let complete = Self::looks_sentence_complete(trimmed);
+        let coverage = if total_audio_ms == 0 {
+            0.0
+        } else {
+            best_audio_ms as f64 / total_audio_ms as f64
+        };
+
+        if best_audio_ms.saturating_add(250) >= total_audio_ms && (chars >= 4 || words >= 1) {
+            return false;
+        }
+        if total_audio_ms <= 4_000 && coverage >= 0.65 && (chars >= 8 || words >= 2) {
+            return false;
+        }
+        if total_audio_ms <= 8_000 && coverage >= 0.75 && (chars >= 14 || words >= 3) {
+            return false;
+        }
+        if total_audio_ms <= 15_000 && coverage >= 0.80 && (chars >= 20 || words >= 4) {
+            return false;
+        }
 
         if best_audio_ms.saturating_add(500) < total_audio_ms {
-            let coverage = if total_audio_ms == 0 {
-                0.0
-            } else {
-                best_audio_ms as f64 / total_audio_ms as f64
-            };
             let tail_gap_ms = total_audio_ms.saturating_sub(best_audio_ms);
             // Avoid cutting off last words: if the tail gap is noticeable and sentence
             // does not look complete, prefer full pass.
@@ -1050,7 +1246,7 @@ impl TranscribeProvider for LocalProvider {
     }
 
     fn requires_audio_input(&self) -> bool {
-        true
+        !self.cfg.streaming_enabled
     }
 
     async fn stream_audio(
@@ -1058,45 +1254,39 @@ impl TranscribeProvider for LocalProvider {
         mut audio_rx: mpsc::Receiver<Vec<u8>>,
         sample_rate: u32,
         is_streaming: Arc<AtomicBool>,
+        updates_tx: mpsc::UnboundedSender<TranscriptionEvent>,
     ) -> Result<String> {
-        if !self.cfg.streaming_enabled {
+        if self.cfg.streaming_enabled {
             info!(
-                "Starting local whisper-server transcription ({} Hz, single-pass, language={:?})...",
-                sample_rate,
-                self.cfg.request_language
+                "Starting local true-stream mode via whisper-stream (language={:?}, step_ms={}, length_ms={}, keep_ms={})...",
+                self.cfg.request_language,
+                self.cfg.stream_step_ms,
+                self.cfg.stream_length_ms,
+                self.cfg.stream_keep_ms
             );
-            let mut audio_rx = audio_rx;
-            let mut pcm_bytes = Vec::new();
-            while let Some(chunk) = audio_rx.recv().await {
-                if !chunk.is_empty() {
-                    pcm_bytes.extend_from_slice(&chunk);
-                }
-                if !is_streaming.load(Ordering::SeqCst) {
-                    break;
-                }
-            }
-            if pcm_bytes.is_empty() {
-                return Ok(String::new());
-            }
-            return self.transcribe_pcm_wav(sample_rate, pcm_bytes).await;
+            let text = self
+                .transcribe_true_stream(is_streaming, &updates_tx)
+                .await?;
+            send_final_update(&updates_tx, &mut String::new(), text.clone());
+            return Ok(text);
         }
 
         info!(
             "Starting local streaming over whisper-server snapshots ({} Hz, language={:?})...",
-            sample_rate,
-            self.cfg.request_language
+            sample_rate, self.cfg.request_language
         );
 
         let mut pcm_bytes = Vec::new();
         let bytes_per_ms = ((sample_rate as usize).saturating_mul(2) / 1000).max(1);
         let mut bytes_since_snapshot = 0usize;
-        let mut snapshot_task: Option<tokio::task::JoinHandle<Result<String>>> = None;
+        let mut snapshot_task: Option<tokio::task::JoinHandle<Result<LocalTranscription>>> = None;
         let mut snapshot_started_at: Option<Instant> = None;
         let mut last_snapshot_latency_ms: Option<u64> = None;
         let mut inflight_snapshot_audio_ms: Option<u64> = None;
         let mut best_stream_text = String::new();
         let mut best_stream_score = 0usize;
         let mut best_stream_audio_ms = 0u64;
+        let mut last_sent_partial = String::new();
         let auto_mode = self
             .cfg
             .request_language
@@ -1118,19 +1308,19 @@ impl TranscribeProvider for LocalProvider {
                         last_snapshot_latency_ms = Some(started.elapsed().as_millis() as u64);
                     }
                     match handle.await {
-                        Ok(Ok(text)) if !text.trim().is_empty() => {
-                            if auto_mode && detected_lang.is_none() {
-                                detected_lang = Self::infer_lang_from_text(&text);
-                                if let Some(lang) = &detected_lang {
-                                    debug!("local auto-lang locked to '{}'", lang);
-                                }
-                            }
-                            let score = Self::text_score(&text);
+                        Ok(Ok(result)) if !result.text.trim().is_empty() => {
+                            Self::update_detected_lang(auto_mode, &mut detected_lang, &result);
+                            let score = Self::text_score(&result.text);
                             let covered_ms = inflight_snapshot_audio_ms.unwrap_or(0);
                             if covered_ms >= best_stream_audio_ms || score >= best_stream_score {
                                 best_stream_audio_ms = covered_ms;
                                 best_stream_score = score;
-                                best_stream_text = text;
+                                best_stream_text = result.text;
+                                send_partial_update(
+                                    &updates_tx,
+                                    &mut last_sent_partial,
+                                    best_stream_text.clone(),
+                                );
                             }
                         }
                         Ok(Ok(_)) => {}
@@ -1146,7 +1336,9 @@ impl TranscribeProvider for LocalProvider {
             let step_ms = Self::adaptive_step_ms(total_audio_ms, last_snapshot_latency_ms);
             let step_bytes = (step_ms as usize).saturating_mul(bytes_per_ms).max(3200);
             let min_start_ms = Self::min_snapshot_start_ms(total_audio_ms);
-            let min_start_bytes = (min_start_ms as usize).saturating_mul(bytes_per_ms).max(3200);
+            let min_start_bytes = (min_start_ms as usize)
+                .saturating_mul(bytes_per_ms)
+                .max(3200);
 
             if bytes_since_snapshot >= step_bytes
                 && pcm_bytes.len() >= min_start_bytes
@@ -1165,7 +1357,11 @@ impl TranscribeProvider for LocalProvider {
                 );
                 snapshot_task = Some(tokio::spawn(async move {
                     provider
-                        .transcribe_pcm_wav_with_lang(sample_rate, snapshot, lang_hint.as_deref())
+                        .transcribe_pcm_wav_result_with_lang(
+                            sample_rate,
+                            snapshot,
+                            lang_hint.as_deref(),
+                        )
                         .await
                 }));
             }
@@ -1185,19 +1381,14 @@ impl TranscribeProvider for LocalProvider {
                     last_snapshot_latency_ms = Some(started.elapsed().as_millis() as u64);
                 }
                 match handle.await {
-                    Ok(Ok(text)) if !text.trim().is_empty() => {
-                        if auto_mode && detected_lang.is_none() {
-                            detected_lang = Self::infer_lang_from_text(&text);
-                            if let Some(lang) = &detected_lang {
-                                debug!("local auto-lang locked to '{}'", lang);
-                            }
-                        }
-                        let score = Self::text_score(&text);
+                    Ok(Ok(result)) if !result.text.trim().is_empty() => {
+                        Self::update_detected_lang(auto_mode, &mut detected_lang, &result);
+                        let score = Self::text_score(&result.text);
                         let covered_ms = inflight_snapshot_audio_ms.unwrap_or(0);
                         if covered_ms >= best_stream_audio_ms || score >= best_stream_score {
                             best_stream_audio_ms = covered_ms;
                             best_stream_score = score;
-                            best_stream_text = text;
+                            best_stream_text = result.text;
                         }
                     }
                     Ok(Ok(_)) => {}
@@ -1219,22 +1410,29 @@ impl TranscribeProvider for LocalProvider {
                     match timeout(Duration::from_millis(wait_ms), &mut handle).await {
                         Ok(joined) => {
                             if let Some(started) = snapshot_started_at.take() {
-                                last_snapshot_latency_ms = Some(started.elapsed().as_millis() as u64);
+                                last_snapshot_latency_ms =
+                                    Some(started.elapsed().as_millis() as u64);
                             }
                             match joined {
-                                Ok(Ok(text)) if !text.trim().is_empty() => {
-                                    if auto_mode && detected_lang.is_none() {
-                                        detected_lang = Self::infer_lang_from_text(&text);
-                                        if let Some(lang) = &detected_lang {
-                                            debug!("local auto-lang locked to '{}'", lang);
-                                        }
-                                    }
-                                    let score = Self::text_score(&text);
+                                Ok(Ok(result)) if !result.text.trim().is_empty() => {
+                                    Self::update_detected_lang(
+                                        auto_mode,
+                                        &mut detected_lang,
+                                        &result,
+                                    );
+                                    let score = Self::text_score(&result.text);
                                     let covered_ms = inflight_snapshot_audio_ms.unwrap_or(0);
-                                    if covered_ms >= best_stream_audio_ms || score >= best_stream_score {
+                                    if covered_ms >= best_stream_audio_ms
+                                        || score >= best_stream_score
+                                    {
                                         best_stream_audio_ms = covered_ms;
                                         best_stream_score = score;
-                                        best_stream_text = text;
+                                        best_stream_text = result.text;
+                                        send_partial_update(
+                                            &updates_tx,
+                                            &mut last_sent_partial,
+                                            best_stream_text.clone(),
+                                        );
                                     }
                                 }
                                 Ok(Ok(_)) => {}
@@ -1259,7 +1457,7 @@ impl TranscribeProvider for LocalProvider {
             } else {
                 let final_audio_ms = (pcm_bytes.len() / bytes_per_ms) as u64;
                 let inflight_audio_ms = inflight_snapshot_audio_ms.unwrap_or(final_audio_ms);
-                let wait_ms = Self::release_wait_timeout_ms(inflight_audio_ms);
+                let wait_ms = Self::release_wait_timeout_ms(inflight_audio_ms).max(2_200);
                 debug!(
                     "local: waiting in-flight first snapshot after release (wait_ms={}, inflight_audio_ms={}, final_audio_ms={})",
                     wait_ms, inflight_audio_ms, final_audio_ms
@@ -1271,19 +1469,20 @@ impl TranscribeProvider for LocalProvider {
                             last_snapshot_latency_ms = Some(started.elapsed().as_millis() as u64);
                         }
                         match joined {
-                            Ok(Ok(text)) if !text.trim().is_empty() => {
-                                if auto_mode && detected_lang.is_none() {
-                                    detected_lang = Self::infer_lang_from_text(&text);
-                                    if let Some(lang) = &detected_lang {
-                                        debug!("local auto-lang locked to '{}'", lang);
-                                    }
-                                }
-                                let score = Self::text_score(&text);
+                            Ok(Ok(result)) if !result.text.trim().is_empty() => {
+                                Self::update_detected_lang(auto_mode, &mut detected_lang, &result);
+                                let score = Self::text_score(&result.text);
                                 let covered_ms = inflight_snapshot_audio_ms.unwrap_or(0);
-                                if covered_ms >= best_stream_audio_ms || score >= best_stream_score {
+                                if covered_ms >= best_stream_audio_ms || score >= best_stream_score
+                                {
                                     best_stream_audio_ms = covered_ms;
                                     best_stream_score = score;
-                                    best_stream_text = text;
+                                    best_stream_text = result.text;
+                                    send_partial_update(
+                                        &updates_tx,
+                                        &mut last_sent_partial,
+                                        best_stream_text.clone(),
+                                    );
                                 }
                             }
                             Ok(Ok(_)) => {}
@@ -1312,6 +1511,11 @@ impl TranscribeProvider for LocalProvider {
                 best_stream_audio_ms,
                 final_audio_ms
             );
+            send_final_update(
+                &updates_tx,
+                &mut last_sent_partial,
+                best_stream_text.clone(),
+            );
             return Ok(best_stream_text);
         }
 
@@ -1322,14 +1526,15 @@ impl TranscribeProvider for LocalProvider {
         );
         let full_start = Instant::now();
         let final_text = self
-            .transcribe_pcm_wav_with_lang(sample_rate, pcm_bytes, detected_lang.as_deref())
+            .transcribe_pcm_wav_result_with_lang(sample_rate, pcm_bytes, detected_lang.as_deref())
             .await?;
         debug!(
             "local: full pass finished in {} ms, chars={}",
             full_start.elapsed().as_millis(),
-            final_text.chars().count()
+            final_text.text.chars().count()
         );
-        Ok(final_text)
+        send_final_update(&updates_tx, &mut last_sent_partial, final_text.text.clone());
+        Ok(final_text.text)
     }
 }
 
@@ -1354,6 +1559,7 @@ impl TranscribeProvider for AwsProvider {
         mut audio_rx: mpsc::Receiver<Vec<u8>>,
         sample_rate: u32,
         is_streaming: Arc<AtomicBool>,
+        updates_tx: mpsc::UnboundedSender<TranscriptionEvent>,
     ) -> Result<String> {
         let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .load()
@@ -1380,6 +1586,24 @@ impl TranscribeProvider for AwsProvider {
         let feed_task = tokio::spawn(async move {
             match media_encoding_for_feed {
                 AwsMediaEncoding::Pcm => {
+                    // Pre-fill: send 600 ms of silence so AWS initialises its
+                    // language model before real speech arrives.  This prevents
+                    // the first word from being clipped or garbled due to the
+                    // TLS/HTTP-2 setup latency (~300-500 ms).
+                    let silence_samples = (sample_rate as usize * 600 / 1000) * 2; // 16-bit mono
+                    let silence = vec![0u8; silence_samples];
+                    let silence_event = AwsAudioEvent::builder()
+                        .audio_chunk(Blob::new(silence))
+                        .build();
+                    if event_tx
+                        .send(Ok(AwsAudioStream::AudioEvent(silence_event)))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    debug!("aws pcm feeder: sent 600 ms silence pre-fill");
+
                     while let Some(chunk) = audio_rx.recv().await {
                         if chunk.is_empty() {
                             continue;
@@ -1395,7 +1619,8 @@ impl TranscribeProvider for AwsProvider {
                             break;
                         }
                         if !is_streaming_for_feed.load(Ordering::SeqCst) {
-                            debug!("aws pcm feeder observed is_streaming=false");
+                            debug!("aws pcm feeder observed is_streaming=false, breaking");
+                            break;
                         }
                     }
                 }
@@ -1441,7 +1666,8 @@ impl TranscribeProvider for AwsProvider {
                                 break;
                             }
                             if !is_streaming_writer.load(Ordering::SeqCst) {
-                                debug!("aws opus writer observed is_streaming=false");
+                                debug!("aws opus writer observed is_streaming=false, breaking");
+                                break;
                             }
                         }
                         drop(stdin);
@@ -1545,6 +1771,7 @@ impl TranscribeProvider for AwsProvider {
             .context("AWS start_stream_transcription failed")?;
 
         let mut final_transcript = String::new();
+        let mut last_sent_partial = String::new();
 
         while let Some(event) = output
             .transcript_result_stream
@@ -1557,16 +1784,27 @@ impl TranscribeProvider for AwsProvider {
                     if let Some(transcript) = transcript_event.transcript {
                         if let Some(results) = transcript.results {
                             for result in results {
-                                if result.is_partial {
-                                    continue;
-                                }
                                 if let Some(alternatives) = result.alternatives {
                                     if let Some(alt) = alternatives.first() {
                                         if let Some(text) = &alt.transcript {
-                                            if !text.trim().is_empty() {
+                                            if text.trim().is_empty() {
+                                                continue;
+                                            }
+                                            if result.is_partial {
+                                                send_partial_update(
+                                                    &updates_tx,
+                                                    &mut last_sent_partial,
+                                                    join_transcript_parts(&final_transcript, text),
+                                                );
+                                            } else {
                                                 debug!("AWS final chunk: {}", text);
                                                 final_transcript.push_str(text.trim());
                                                 final_transcript.push(' ');
+                                                send_partial_update(
+                                                    &updates_tx,
+                                                    &mut last_sent_partial,
+                                                    final_transcript.trim().to_string(),
+                                                );
                                             }
                                         }
                                     }
@@ -1584,8 +1822,9 @@ impl TranscribeProvider for AwsProvider {
         if let Err(e) = feed_task.await {
             warn!("aws feeder task join error: {}", e);
         }
-
-        Ok(final_transcript.trim().to_string())
+        let final_text = final_transcript.trim().to_string();
+        send_final_update(&updates_tx, &mut last_sent_partial, final_text.clone());
+        Ok(final_text)
     }
 }
 
@@ -1689,7 +1928,10 @@ while true; do sleep 1; done
         });
 
         let text = provider
-            .transcribe_true_stream(is_streaming)
+            .transcribe_true_stream(
+                is_streaming,
+                &mpsc::unbounded_channel::<TranscriptionEvent>().0,
+            )
             .await
             .expect("true stream must return text");
         assert_eq!(text, "тестовая фраза для распознавания");
@@ -1709,6 +1951,60 @@ while true; do sleep 1; done
             AwsMediaEncoding::parse("opus").unwrap(),
             AwsMediaEncoding::OggOpus
         );
+    }
+
+    #[test]
+    fn local_auto_language_is_not_sent_as_literal_auto() {
+        assert_eq!(
+            LocalProvider::normalize_request_language_param(Some("auto")),
+            None
+        );
+        assert_eq!(
+            LocalProvider::normalize_request_language_param(Some("AUTO")),
+            None
+        );
+        assert_eq!(
+            LocalProvider::normalize_request_language_param(Some("ru-RU")),
+            Some("ru".to_string())
+        );
+    }
+
+    #[test]
+    fn local_short_complete_snapshot_does_not_force_full_pass() {
+        assert!(!LocalProvider::should_force_full_pass(
+            2_400,
+            2_300,
+            "Привет мир."
+        ));
+        assert!(!LocalProvider::should_force_full_pass(
+            3_200,
+            2_600,
+            "Hello there!"
+        ));
+    }
+
+    #[test]
+    fn local_force_full_pass_when_snapshot_is_obviously_truncated() {
+        assert!(LocalProvider::should_force_full_pass(
+            6_000,
+            2_000,
+            "незаконченная фраза"
+        ));
+        assert!(LocalProvider::should_force_full_pass(10_000, 5_000, "hi"));
+    }
+
+    #[test]
+    fn runtime_config_respects_local_streaming_flag() {
+        unsafe {
+            std::env::set_var("S2T_ASR_PROVIDER", "local");
+            std::env::set_var("S2T_LOCAL_STREAMING", "0");
+        }
+        let cfg = RuntimeConfig::from_env().expect("runtime config");
+        assert!(!cfg.local.streaming_enabled);
+        unsafe {
+            std::env::remove_var("S2T_LOCAL_STREAMING");
+            std::env::remove_var("S2T_ASR_PROVIDER");
+        }
     }
 
     #[tokio::test]
@@ -1775,7 +2071,12 @@ while true; do sleep 1; done
         });
 
         let text = provider
-            .stream_audio(rx, sample_rate, is_streaming)
+            .stream_audio(
+                rx,
+                sample_rate,
+                is_streaming,
+                mpsc::unbounded_channel::<TranscriptionEvent>().0,
+            )
             .await
             .expect("aws stream must succeed");
 
